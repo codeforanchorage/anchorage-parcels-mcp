@@ -12,10 +12,10 @@ api_quota_limit = 3000
 api_rate_limit  = 5
 api_burst_limit = 10
 
-# Domain decision still open (e.g. anchorage-parcels.codeforanchorage.org).
-# Leave empty to serve on the raw API Gateway URL; set it (plus ACM cert
-# and DNS) and redeploy when decided.
-custom_domain = ""
+# DNS lives in Dreamhost. Two CNAMEs required: the ACM validation record
+# (from `terraform output acm_validation_cname_*`) and the traffic record
+# pointing at `terraform output custom_domain_target`.
+custom_domain = "anchorage-parcels.codeforanchorage.org"
 
 # Cap concurrent Lambda executions. Cost and blast-radius protection;
 # conversational MCP traffic does not need horizontal scale.
