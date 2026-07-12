@@ -1,6 +1,6 @@
 # Built-in Plugins Reference
 
-OpenContext includes built-in plugins for CKAN and Socrata open data portals.
+OpenContext includes built-in plugins for CKAN and Socrata open data portals, plus Anchorage-specific GIS and parcel plugins that are forkable to other cities.
 
 ## CKAN Plugin
 
@@ -114,6 +114,37 @@ This plugin uses two Socrata API layers:
 - **SODA3** (portal domain) - Dataset metadata, schema, data queries
 
 See [Socrata developer documentation](https://dev.socrata.com/) for details.
+
+## Anchorage Parcels Plugin
+
+Domain tools over the Municipality of Anchorage property/assessment records (the public MOA PropertyInformation Feature Layer, plus Addresses and Subdivisions). Read-only; the schema is baked into the tools so no schema pre-flight is needed. Forkable to any city whose assessor publishes a parcel Feature Layer (layer URLs + one field-map block).
+
+### Configuration
+
+```yaml
+plugins:
+  anchorage_parcels:
+    enabled: true
+    # Defaults point at the MOA layers; override to fork for your city
+    # property_layer_url: "https://services2.arcgis.com/<org>/arcgis/rest/services/<Property>/FeatureServer/0"
+    # addresses_layer_url: "..."
+    # subdivisions_layer_url: "..."
+    city_name: "Municipality of Anchorage"
+    field_map: {} # logical->physical field-name overrides
+    timeout: 30
+```
+
+### Tools
+
+- `anchorage_parcels__find_parcel(parcel_id, category, out_fields, limit)` - Parcel lookup across all four MOA ID formats, with fuzzy fallback
+- `anchorage_parcels__get_parcel_details(parcel_id)` - Full assessment record (owner, valuation history, exemptions, deed) + assessor Datalet link
+- `anchorage_parcels__search_by_owner(name, limit, category)` - Owner-name search, ordered by appraised value
+- `anchorage_parcels__search_by_address(address, limit)` - Situs search with address-point/point-in-polygon fallback
+- `anchorage_parcels__parcels_at_point(lat, lon)` - Point-in-polygon across Parcel/Lease/Economic categories
+- `anchorage_parcels__query_parcels(where, out_fields, category, limit, offset, order_by)` - Validated SQL escape hatch with pagination
+- `anchorage_parcels__parcel_stats(stat_type, stat_field, group_by, where, category, percentile)` - Aggregates incl. median via percentile_cont
+
+See [PARCELS.md](PARCELS.md) for the full reference, fork-for-your-city instructions, and deployment steps.
 
 ## Custom Plugins
 
