@@ -1454,7 +1454,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"Economic polygons can stack at one spot, and each "
                     f"hit is labeled with its category. Example: "
                     f"parcels_at_point(lat=61.2091, lon=-149.8944). "
-                    f"{routing_note}"
+                    f"{CASE_SENSITIVE_NOTE} {routing_note}"
                 ),
                 input_schema={
                     "type": "object",
