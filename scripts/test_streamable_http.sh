@@ -12,6 +12,13 @@ if ! command -v jq &> /dev/null; then
 fi
 
 BASE_URL="${1:-http://localhost:8000/mcp}"
+# Optional: tool to call in step 3 and its JSON arguments. Defaults keep
+# the original CKAN behavior; pass e.g.:
+#   ./scripts/test_streamable_http.sh http://localhost:8000/mcp \
+#     anchorage_parcels__find_parcel '{"parcel_id": "002-151-32"}'
+DEFAULT_TOOL_ARGS='{"query": "traffic", "limit": 5}'
+TOOL_NAME="${2:-ckan__search_datasets}"
+TOOL_ARGS="${3:-$DEFAULT_TOOL_ARGS}"
 
 echo "=========================================="
 echo "Testing OpenContext MCP Server"
@@ -114,20 +121,16 @@ TOOL_COUNT=$(echo "$LIST_RESPONSE" | jq '.result.tools | length')
 echo -e "${GREEN}Found $TOOL_COUNT tools${NC}"
 echo ""
 
-# Step 3: Call a tool (ckan__search_datasets)
-echo -e "${BLUE}Step 3: Call tool (ckan__search_datasets)${NC}"
-CALL_REQUEST='{
+# Step 3: Call a tool
+echo -e "${BLUE}Step 3: Call tool ($TOOL_NAME)${NC}"
+# Args are passed to jq via the environment (not argv) so JSON quoting
+# survives on Windows/Git Bash, where argv to a native jq.exe is mangled.
+CALL_REQUEST=$(TOOL_NAME="$TOOL_NAME" TOOL_ARGS="$TOOL_ARGS" jq -n '{
   "jsonrpc": "2.0",
   "id": 3,
   "method": "tools/call",
-  "params": {
-    "name": "ckan__search_datasets",
-    "arguments": {
-      "query": "traffic",
-      "limit": 5
-    }
-  }
-}'
+  "params": {"name": env.TOOL_NAME, "arguments": (env.TOOL_ARGS | fromjson)}
+}')
 
 echo "Request:"
 echo "$CALL_REQUEST" | jq '.'
