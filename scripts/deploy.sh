@@ -21,13 +21,15 @@ cd "$PROJECT_ROOT"
 # Parse named arguments
 ENVIRONMENT=""
 TF_WORKSPACE=""
+AUTO_APPROVE="false"
 
 show_usage() {
-    echo "Usage: $0 --environment <staging|prod> [--tfworkspace <name>]"
+    echo "Usage: $0 --environment <staging|prod> [--tfworkspace <name>] [--yes]"
     echo ""
     echo "Options:"
     echo "  --environment, -e   Deployment environment: staging or prod (required)"
-    echo "  --tfworkspace, -w   Terraform workspace name (default: boston-staging or boston-prod)"
+    echo "  --tfworkspace, -w   Terraform workspace name (default: anchorage-parcels-staging or anchorage-parcels-prod)"
+    echo "  --yes, -y           Skip the interactive apply confirmation (non-interactive runs)"
     echo "  --help, -h          Show this help message"
 }
 
@@ -40,6 +42,10 @@ while [[ $# -gt 0 ]]; do
         --tfworkspace|-w)
             TF_WORKSPACE="$2"
             shift 2
+            ;;
+        --yes|-y)
+            AUTO_APPROVE="true"
+            shift
             ;;
         --help|-h)
             show_usage
@@ -65,12 +71,15 @@ if [ "$ENVIRONMENT" != "staging" ] && [ "$ENVIRONMENT" != "prod" ]; then
     exit 1
 fi
 
-# Default workspace per environment when not explicitly provided
+# Default workspace per environment when not explicitly provided.
+# NOTE: this fork deploys the PARCELS server. The GIS server lives in the
+# anchorage-gis-* workspaces of the same state bucket -- never point this
+# script at those or terraform will plan to rename the GIS Lambda.
 if [ -z "$TF_WORKSPACE" ]; then
     if [ "$ENVIRONMENT" = "prod" ]; then
-        TF_WORKSPACE="anchorage-gis-prod"
+        TF_WORKSPACE="anchorage-parcels-prod"
     else
-        TF_WORKSPACE="anchorage-gis-staging"
+        TF_WORKSPACE="anchorage-parcels-staging"
     fi
 fi
 
@@ -338,11 +347,15 @@ echo -e "   Workspace:   ${TF_WORKSPACE}"
 echo -e "   Lambda:      ${LAMBDA_NAME}"
 echo -e "   Region:      ${AWS_REGION}"
 echo ""
-read -r -p "Do you want to proceed with deployment? (yes/no): " CONFIRM
-if [ "$CONFIRM" != "yes" ] && [ "$CONFIRM" != "y" ]; then
-    echo -e "${YELLOW}Deployment cancelled by user.${NC}"
-    rm -f tfplan
-    exit 0
+if [ "$AUTO_APPROVE" = "true" ]; then
+    echo -e "${YELLOW}--yes supplied: applying without interactive confirmation.${NC}"
+else
+    read -r -p "Do you want to proceed with deployment? (yes/no): " CONFIRM
+    if [ "$CONFIRM" != "yes" ] && [ "$CONFIRM" != "y" ]; then
+        echo -e "${YELLOW}Deployment cancelled by user.${NC}"
+        rm -f tfplan
+        exit 0
+    fi
 fi
 echo ""
 
