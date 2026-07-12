@@ -1,0 +1,86 @@
+---
+server_name: "Anchorage Parcels MCP"
+description: "Municipality of Anchorage property and assessment records - parcels, leases, and economic units with owners, valuations, and exemptions"
+organization: "Municipality of Anchorage"
+
+# Per-deployment guidance returned in the MCP `initialize` response.
+# Applies to EVERY consumer -- the text is model-agnostic. Pushes the
+# model to answer WHO-OWNS / WHAT'S-IT-WORTH / WHAT'S-AT-THIS-ADDRESS
+# questions in ONE call with the schema already baked into the tools,
+# and to route non-assessment questions to the Anchorage GIS MCP.
+instructions: |
+  You are connected to the Municipality of Anchorage property/assessment
+  records (the MOA PropertyInformation layer: ~98k parcels plus lease and
+  economic-unit overlays, republished frequently by the assessor). These
+  tools answer WHO OWNS IT / WHAT'S IT WORTH / WHAT'S AT THIS ADDRESS
+  questions in one call -- the field schema is already baked in, so you
+  never need a schema pre-flight.
+
+  Typical flow:
+  1. find_parcel(parcel_id=...) accepts a parcel number in ANY of the
+     four MOA formats ('002-151-32', '00215132', '00215132000',
+     '002-151-32-000') and falls back to fuzzy candidates on a miss.
+  2. get_parcel_details(parcel_id=...) then returns the full assessment
+     record -- owner mailing address, valuation for the current and two
+     prior years, exemptions, deed/plat -- ending with the assessor
+     Datalet link, which you should surface to the user.
+  Address questions go straight to search_by_address; owner questions to
+  search_by_owner; coordinates to parcels_at_point.
+
+  Aggregate questions are parcel_stats calls, not record listings.
+  Worked example -- "median assessed value by zoning district":
+    parcel_stats(stat_type='percentile_cont',
+                 stat_field='Appraised_Total_Value',
+                 group_by='Zoning_District')
+  (percentile_cont with percentile=0.5 is the median; count/sum/avg/
+  min/max/stddev/var are also available.)
+
+  Data notes: owner names and addresses are stored UPPERCASE (the search
+  tools handle this); records are split by GIS_Category into 'Parcel',
+  'Lease', and 'Economic' -- most tools default to 'Parcel', pass
+  category='All' to widen. Field names are case-sensitive. All values
+  are public-record assessment data published by the Municipality.
+
+  All tools are READ-ONLY and safe to call without confirmation.
+
+  This server covers ONLY the assessment/property layers. For any other
+  MOA layer (zoning polygons, trails, flood zones, parks) or spatial
+  analysis (buffers, overlays, aggregation by polygon), use the
+  Anchorage GIS MCP server instead.
+
+plugins:
+  anchorage_parcels:
+    enabled: true
+    # MOA defaults -- override these three URLs (and field_map) to fork
+    # this server for another city's assessor layers.
+    property_layer_url: "https://services2.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/services/PropertyInformation_Hosted/FeatureServer/0"
+    addresses_layer_url: "https://services2.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/services/Addresses_Hosted/FeatureServer/0"
+    subdivisions_layer_url: "https://services2.arcgis.com/Ce3DhLRthdwbHlfF/arcgis/rest/services/Subdivisions_Hosted/FeatureServer/0"
+    city_name: "Municipality of Anchorage"
+    # Logical -> physical field-name overrides (see DEFAULT_FIELD_MAP in
+    # plugins/anchorage_parcels/plugin.py). Empty for MOA.
+    field_map: {}
+    timeout: 30
+
+  ckan:
+    enabled: false
+    base_url: "https://data.example.gov/"
+    portal_url: "https://data.example.gov/"
+    city_name: "Example"
+    timeout: 120
+
+  arcgis:
+    enabled: false
+    portal_url: "https://hub.arcgis.com"
+    city_name: "Example"
+    timeout: 120
+
+aws:
+  region: "us-west-2"
+  lambda_name: "anchorage-parcels-mcp-staging"
+  lambda_memory: 512
+  lambda_timeout: 60
+
+logging:
+  level: "INFO"
+  format: "json"

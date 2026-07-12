@@ -52,6 +52,20 @@ plugins:
     timeout: 120
     # token: "${ARCGIS_TOKEN}"  # Optional: Bearer token for private items
 
+  # Built-in: Anchorage Parcels (Municipality of Anchorage
+  # property/assessment records; forkable to any city whose assessor
+  # publishes a parcel Feature Layer -- see docs/PARCELS.md)
+  anchorage_parcels:
+    enabled: false # Set to true to use (see config-anchorage-parcels.yaml)
+    # Layer URLs default to the MOA endpoints; override all three (plus
+    # field_map) to point at another city's assessor layers.
+    # property_layer_url: "https://services2.arcgis.com/<org>/arcgis/rest/services/<Property>/FeatureServer/0"
+    # addresses_layer_url: "https://services2.arcgis.com/<org>/arcgis/rest/services/<Addresses>/FeatureServer/0"
+    # subdivisions_layer_url: "https://services2.arcgis.com/<org>/arcgis/rest/services/<Subdivisions>/FeatureServer/0"
+    city_name: "Municipality of Anchorage"
+    field_map: {} # logical->physical overrides; see DEFAULT_FIELD_MAP in plugins/anchorage_parcels/plugin.py
+    timeout: 30
+
   # yamllint disable rule:comments-indentation
   # Custom: Add your own plugins here
   # Example:
