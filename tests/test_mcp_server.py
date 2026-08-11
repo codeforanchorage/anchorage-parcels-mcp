@@ -36,8 +36,9 @@ class TestInitialize:
         assert response["jsonrpc"] == "2.0"
         assert response["id"] == 1
         assert "result" in response
-        # No protocolVersion requested -> server falls back to its default.
-        assert response["result"]["protocolVersion"] == "2025-03-26"
+        # No protocolVersion requested -> server answers with the newest
+        # version it supports.
+        assert response["result"]["protocolVersion"] == "2025-11-25"
         assert "capabilities" in response["result"]
         assert "serverInfo" in response["result"]
         # Empty config -> default server name.
@@ -73,8 +74,8 @@ class TestInitialize:
         assert result["instructions"] == "Start with find_gis_content."
 
     @pytest.mark.asyncio
-    async def test_initialize_unsupported_version_falls_back(self):
-        """An unrecognized requested version falls back to the default."""
+    async def test_initialize_echoes_2025_11_25(self):
+        """The 2025-11-25 revision is supported and echoed back."""
         plugin_manager = MagicMock(spec=PluginManager)
         plugin_manager.config = {}
         server = MCPServer(plugin_manager)
@@ -83,12 +84,33 @@ class TestInitialize:
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
-            "params": {"protocolVersion": "1999-01-01"},
+            "params": {"protocolVersion": "2025-11-25"},
         }
 
         response = await server.handle_request(request)
 
-        assert response["result"]["protocolVersion"] == "2025-03-26"
+        assert response["result"]["protocolVersion"] == "2025-11-25"
+
+    @pytest.mark.asyncio
+    async def test_initialize_unsupported_version_falls_back(self):
+        """An unrecognized requested version (including ones newer than we
+        support, e.g. 2026-07-28) gets the newest supported version back,
+        per the spec's version-negotiation rule."""
+        plugin_manager = MagicMock(spec=PluginManager)
+        plugin_manager.config = {}
+        server = MCPServer(plugin_manager)
+
+        for requested in ("1999-01-01", "2026-07-28"):
+            request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {"protocolVersion": requested},
+            }
+
+            response = await server.handle_request(request)
+
+            assert response["result"]["protocolVersion"] == "2025-11-25", requested
 
     @pytest.mark.asyncio
     async def test_initialize_notification_returns_none(self):

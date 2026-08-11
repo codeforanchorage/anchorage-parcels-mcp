@@ -161,13 +161,22 @@ class MCPServer:
                 return None
             return error_response
 
-    # MCP protocol revisions this server implements. The wire format for a
-    # tools-only server is compatible across these, so we echo the client's
-    # requested version when it's one we recognize, else fall back to a
-    # known-good default. (Previously this was hardcoded, which could make
-    # clients on a newer revision -- e.g. M365 Copilot -- warn or balk.)
-    SUPPORTED_PROTOCOL_VERSIONS = ("2025-06-18", "2025-03-26", "2024-11-05")
-    DEFAULT_PROTOCOL_VERSION = "2025-03-26"
+    # MCP protocol revisions this server implements, newest first. The wire
+    # format for a tools-only server is compatible across these, so we echo
+    # the client's requested version when it's one we recognize. (Previously
+    # this was hardcoded, which could make clients on a newer revision --
+    # e.g. M365 Copilot -- warn or balk.) 2026-07-28 is NOT listed: its core
+    # drops initialize/ping and requires server/discover, resultType, and
+    # cacheable list results, which this server does not implement yet.
+    SUPPORTED_PROTOCOL_VERSIONS = (
+        "2025-11-25",
+        "2025-06-18",
+        "2025-03-26",
+        "2024-11-05",
+    )
+    # On an unrecognized (or absent) requested version the spec says to
+    # answer with the latest version the server supports.
+    DEFAULT_PROTOCOL_VERSION = SUPPORTED_PROTOCOL_VERSIONS[0]
 
     async def _handle_initialize(self, params: Dict[str, Any]) -> Dict[str, Any]:
         """Handle initialize request.

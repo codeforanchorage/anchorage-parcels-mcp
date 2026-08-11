@@ -231,7 +231,8 @@ class TestCORS:
             )
             assert (
                 headers["Access-Control-Allow-Headers"]
-                == "content-type, accept, mcp-session-id"
+                == "content-type, accept, mcp-session-id, "
+                "mcp-protocol-version, mcp-method, mcp-name"
             )
 
     def test_handle_options_returns_cors_headers(self):
@@ -250,7 +251,8 @@ class TestCORS:
         )
         assert (
             headers["Access-Control-Allow-Headers"]
-            == "content-type, accept, mcp-session-id"
+            == "content-type, accept, mcp-session-id, "
+            "mcp-protocol-version, mcp-method, mcp-name"
         )
         assert headers["Access-Control-Max-Age"] == "86400"
         assert body == ""
