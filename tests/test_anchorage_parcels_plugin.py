@@ -480,6 +480,66 @@ class TestGetParcelDetails:
         assert "00215132001" in text and "00215132002" in text
 
     @pytest.mark.asyncio
+    async def test_multiple_matches_lists_all_units_not_just_12(self, plugin):
+        """Regression: a 21-unit condo root must surface every unit.
+
+        The disambiguation list used to be capped at 12 rows, so units
+        13+ were silently dropped and the reported total was wrong.
+        """
+        units = [
+            dict(
+                SAMPLE_RECORD,
+                Parcel_ID=f"002151320{n:02d}",
+                Condo_Unit_Number=str(n),
+            )
+            for n in range(1, 22)
+        ]
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 21}),
+                (is_feature_query, {"features": [feat(**u) for u in units]}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "002-151-32"}
+        )
+        text = tool_text(result)
+        assert "matches 21 records" in text
+        assert "00215132021" in text
+        assert "TRUNCATED" not in text
+        # The disambiguation refetch asks for all units in ID order.
+        slim_call = calls[-1] if "orderByFields" in calls[-1][1] else calls[-2]
+        assert slim_call[1]["orderByFields"] == "Parcel_ID"
+        assert int(slim_call[1]["resultRecordCount"]) >= 21
+
+    @pytest.mark.asyncio
+    async def test_multiple_matches_truncation_banner(self, plugin):
+        """When the true count exceeds the rows returned, say so."""
+        units = [
+            dict(
+                SAMPLE_RECORD,
+                Parcel_ID=f"002151320{n:02d}",
+                Condo_Unit_Number=str(n),
+            )
+            for n in range(1, 13)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 30}),
+                (is_feature_query, {"features": [feat(**u) for u in units]}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "002-151-32"}
+        )
+        text = tool_text(result)
+        assert "matches 30 records" in text
+        assert "LIST TRUNCATED" in text
+        assert "first 12 of 30" in text
+
+    @pytest.mark.asyncio
     async def test_no_match_points_at_find_parcel(self, plugin):
         install_client(plugin, routes=[(is_feature_query, {"features": []})])
         result = await run_tool(

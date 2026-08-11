@@ -880,7 +880,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             + ")"
         )
 
-        records, _ = await self._query_property_layer(where, "*", 12)
+        records, _ = await self._query_property_layer(where, "*", 2)
         if not records:
             return (
                 f"No property record found for `{parcel_id}`. "
@@ -890,8 +890,31 @@ class AnchorageParcelsPlugin(MCPPlugin):
             )
         if len(records) > 1:
             # Condos share a parcel root; Parcel_ID_Count > 1 marks it.
+            # Refetch slim columns so every unit is listed -- large
+            # complexes have far more units than one detail page's worth.
+            slim_fields = ",".join(
+                self._f(k)
+                for k in (
+                    "parcel_id",
+                    "category",
+                    "condo_unit",
+                    "situs_address",
+                    "owner_name",
+                )
+            )
+            (records, exceeded), total = await asyncio.gather(
+                self._query_property_layer(
+                    where,
+                    slim_fields,
+                    self.MAX_LIMIT,
+                    order_by=self._f("parcel_id"),
+                ),
+                self._fetch_count(where),
+            )
+            if total is None:
+                total = f"{len(records)}+" if exceeded else len(records)
             lines = [
-                f"`{parcel_id}` matches {len(records)} records (condo "
+                f"`{parcel_id}` matches {total} records (condo "
                 f"units and lease/economic overlays share parcel roots). "
                 f"Which unit do you want? Pass the exact 11-digit "
                 f"{self._f('parcel_id')} to get_parcel_details:",
@@ -904,6 +927,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"unit={r.get(self._f('condo_unit')) or '--'} -- "
                     f"{r.get(self._f('situs_address'))} -- "
                     f"{r.get(self._f('owner_name'))}"
+                )
+            if exceeded or (isinstance(total, int) and total > len(records)):
+                lines.append("")
+                lines.append(
+                    f"**LIST TRUNCATED:** showing the first "
+                    f"{len(records)} of {total} matching records. Page "
+                    f"through the rest with query_parcels using the "
+                    f"same parcel number and an offset."
                 )
             return "\n".join(lines)
 
