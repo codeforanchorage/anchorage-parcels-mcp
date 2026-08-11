@@ -190,7 +190,13 @@ class UniversalHTTPHandler:
             "Access-Control-Allow-Origin": allow_origin,
             "Vary": "Origin",
             "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "content-type, accept, mcp-session-id",
+            # mcp-protocol-version is required on requests since spec
+            # 2025-06-18; mcp-method/mcp-name arrive with 2026-07-28.
+            # Preflight must allow them or browser clients fail CORS.
+            "Access-Control-Allow-Headers": (
+                "content-type, accept, mcp-session-id, "
+                "mcp-protocol-version, mcp-method, mcp-name"
+            ),
             "Access-Control-Expose-Headers": "x-request-id, mcp-session-id",
         }
 
