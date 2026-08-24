@@ -60,7 +60,11 @@ plugins:
     # Logical -> physical field-name overrides (see DEFAULT_FIELD_MAP in
     # plugins/anchorage_parcels/plugin.py). Empty for MOA.
     field_map: {}
-    timeout: 30
+    # Per-request HTTP timeout to ArcGIS. Kept UNDER the Lambda timeout
+    # (aws.lambda_timeout below) so a hung upstream surfaces as a clean
+    # tool error the model can read, instead of the Lambda being killed
+    # mid-flight and the caller getting an opaque gateway error.
+    timeout: 25
 
   ckan:
     enabled: false
@@ -79,7 +83,17 @@ aws:
   region: "us-west-2"
   lambda_name: "anchorage-parcels-mcp-staging"
   lambda_memory: 512
-  lambda_timeout: 60
+  # 28s, deliberately just UNDER the REST API Gateway integration
+  # timeout, which is a hard 29s and NOT adjustable. With a longer
+  # Lambda timeout a slow call keeps burning billed compute and holding
+  # a reserved-concurrency slot long after the client already got its
+  # 504.
+  #
+  # THIS FILE WINS over terraform/aws/*.tfvars for lambda_timeout and
+  # lambda_memory (see terraform/aws/main.tf locals) -- but NOT for
+  # lambda_name, where tfvars wins. Note also that deploy.sh copies this
+  # file to terraform/aws/config.yaml, so editing that copy is a no-op.
+  lambda_timeout: 28
 
 logging:
   level: "INFO"
