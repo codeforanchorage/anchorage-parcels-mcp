@@ -297,10 +297,17 @@ class PluginManager:
                     "description": tool_def.description,
                     "inputSchema": tool_def.input_schema,
                 }
+                # `title` is a top-level Tool field, not an annotation.
+                if tool_def.title:
+                    tool_dict["title"] = tool_def.title
                 if tool_def.annotations:
                     tool_dict["annotations"] = tool_def.annotations
                 tools.append(tool_dict)
 
+        # Ordering is deterministic: plugins preserve insertion order and
+        # each plugin returns a static tool list, so tools/list is byte
+        # identical between calls. Clients can cache it, and an unchanged
+        # list keeps prompt-cache hits alive.
         return tools
 
     async def health_check(self) -> Dict[str, bool]:

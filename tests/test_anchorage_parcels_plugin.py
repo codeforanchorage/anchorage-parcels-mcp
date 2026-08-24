@@ -16,6 +16,7 @@ import pytest
 from pydantic import ValidationError
 
 from core.interfaces import PluginType
+from core.plugin_manager import PluginManager
 from plugins.anchorage_parcels.config_schema import (
     DEFAULT_ADDRESSES_LAYER_URL,
     DEFAULT_PROPERTY_LAYER_URL,
@@ -172,6 +173,51 @@ class TestGetTools:
         # tools/list must not require a live layer fetch.
         p = AnchorageParcelsPlugin({})
         assert len(p.get_tools()) == 7
+
+
+class TestToolMetadata:
+    """tools/list metadata: title, annotations, deterministic ordering."""
+
+    @staticmethod
+    def _manager(plugin):
+        manager = PluginManager({})
+        manager.plugins = {"anchorage_parcels": plugin}
+        return manager
+
+    def test_every_tool_declares_a_title(self, plugin):
+        """The wire `name` is plugin-prefixed and reads badly in a picker."""
+        for t in plugin.get_tools():
+            assert t.title, f"{t.name} has no title"
+            assert t.title != t.name
+
+    def test_title_is_emitted_top_level_not_as_an_annotation(self, plugin):
+        """`title` is a top-level Tool field via BaseMetadata.
+
+        Display precedence is title -> annotations.title -> name, so a
+        title buried in annotations would be ignored by any client
+        reading the top-level field.
+        """
+        for tool in self._manager(plugin).get_all_tools():
+            assert "title" in tool, tool["name"]
+            assert "title" not in tool.get("annotations", {}), tool["name"]
+
+    def test_idempotent_hint_is_not_set(self, plugin):
+        """Documented as meaningful only when readOnlyHint is false, so
+        setting it on these read-only tools would be noise."""
+        for t in plugin.get_tools():
+            assert "idempotentHint" not in t.annotations, t.name
+
+    def test_tools_list_ordering_is_deterministic(self, plugin):
+        """Stable ordering lets clients cache tools/list and keeps
+        prompt-cache hits alive."""
+        manager = self._manager(plugin)
+        first = [t["name"] for t in manager.get_all_tools()]
+        for _ in range(3):
+            assert [t["name"] for t in manager.get_all_tools()] == first
+
+    def test_tool_names_are_prefixed(self, plugin):
+        for tool in self._manager(plugin).get_all_tools():
+            assert tool["name"].startswith("anchorage_parcels__")
 
 
 # ── Config schema ──────────────────────────────────────────────────────

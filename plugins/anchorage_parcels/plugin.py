@@ -1384,6 +1384,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
     # ── Tool definitions ──────────────────────────────────────────────
 
     def get_tools(self) -> List[ToolDefinition]:
+        # Every tool here is a read-only wrapper over an external ArcGIS
+        # service: readOnlyHint lets a client skip per-call confirmation,
+        # openWorldHint says the result set is not a closed domain.
+        # idempotentHint is deliberately ABSENT -- the schema documents it
+        # as meaningful only when readOnlyHint is false, so setting it
+        # here would be noise.
         annotations = {"readOnlyHint": True, "openWorldHint": True}
         city = (
             self.plugin_config.city_name
@@ -1412,6 +1418,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         return [
             ToolDefinition(
                 name="find_parcel",
+                title="Find Parcel by Number",
                 description=(
                     f"Look up {city} parcels by parcel number in ANY of "
                     f"the four MOA formats -- '002-151-32', '00215132', "
@@ -1451,6 +1458,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="get_parcel_details",
+                title="Parcel Detail Report",
                 description=(
                     f"Full assessment record for one {city} parcel: "
                     f"identity/legal, situs, owner mailing address, "
@@ -1479,6 +1487,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="search_by_owner",
+                title="Search Parcels by Owner",
                 description=(
                     f"Find {city} parcels by owner name (substring "
                     f"match, case-insensitive), ordered by appraised "
@@ -1510,6 +1519,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="search_by_address",
+                title="Search Parcels by Address",
                 description=(
                     f"Find {city} parcels by street address. Tries the "
                     f"parcel situs address first; on zero hits it "
@@ -1543,6 +1553,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="parcels_at_point",
+                title="Parcels at Coordinates",
                 description=(
                     f"Find every {city} property record whose polygon "
                     f"contains a WGS84 point -- Parcel, Lease, and "
@@ -1572,6 +1583,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="query_parcels",
+                title="Query Parcels",
                 description=(
                     f"Escape hatch: run a SQL WHERE clause against the "
                     f"{city} property layer with pagination. Example: "
@@ -1620,6 +1632,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="parcel_stats",
+                title="Parcel Statistics",
                 description=(
                     f"Aggregate statistics over {city} property records: "
                     f"count, sum, avg, min, max, stddev, var, or "
