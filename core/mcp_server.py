@@ -343,9 +343,17 @@ class MCPServer:
         result = await self.plugin_manager.execute_tool(tool_name, arguments)
 
         if result.success:
-            return {
-                "content": result.content,
-            }
+            response: Dict[str, Any] = {"content": result.content}
+            if result.structured_content is not None:
+                # The spec suggests ALSO serialising the JSON into a text
+                # block for backwards compatibility. We deliberately do
+                # not: the prose block already in `content` is the
+                # human/model-readable rendering of the same data, and
+                # duplicating it as raw JSON would roughly double the
+                # token cost of every response for a consumer that is
+                # usually an LLM.
+                response["structuredContent"] = result.structured_content
+            return response
         else:
             error_msg = result.error_message or "An unknown error occurred"
             # Include error in content so all clients (curl, Inspector, Claude) receive it.

@@ -26,6 +26,9 @@ dev = [
     "pytest-xdist>=3.0.0",
     "ruff>=0.1.0",
     "pip-audit>=2.0.0",
+    # Validates real tool output against each declared outputSchema.
+    # A declared schema is a binding contract, so it is tested like one.
+    "jsonschema>=4.0.0",
 ]
 
 [project.urls]
