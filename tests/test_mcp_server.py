@@ -479,6 +479,27 @@ class TestUnknownMethods:
         assert "Unknown method" in response["error"]["data"]
 
 
+class TestMalformedJsonLogging:
+    """Bad JSON from a client is a caller error, not a server fault."""
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_logs_warning_without_traceback(self, caplog):
+        plugin_manager = MagicMock(spec=PluginManager)
+        server = MCPServer(plugin_manager)
+
+        with caplog.at_level(logging.WARNING, logger="core.mcp_server"):
+            response = await server.handle_http_request("{not json")
+
+        # The client still gets the correct protocol error...
+        assert response["statusCode"] == 400
+        assert json.loads(response["body"])["error"]["code"] == -32700
+        # ...but our own json.loads stack trace is not log noise.
+        records = [r for r in caplog.records if "Invalid JSON" in r.getMessage()]
+        assert records, "expected a WARNING for the malformed body"
+        assert all(r.levelno == logging.WARNING for r in records)
+        assert all(r.exc_info is None for r in records)
+
+
 class TestMalformedToolsCall:
     """A malformed tools/call is a caller error: -32602, never -32603."""
 

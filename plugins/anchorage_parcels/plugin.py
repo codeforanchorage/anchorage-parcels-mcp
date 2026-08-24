@@ -28,7 +28,13 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 
-from core.interfaces import MCPPlugin, PluginType, ToolDefinition, ToolResult
+from core.interfaces import (
+    MCPPlugin,
+    PluginType,
+    ToolDefinition,
+    ToolInputError,
+    ToolResult,
+)
 from plugins.anchorage_gis.plugin import AnchorageGISPlugin
 from plugins.anchorage_parcels.config_schema import AnchorageParcelsPluginConfig
 from plugins.arcgis.where_validator import (
@@ -506,7 +512,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if normalized == "All" or normalized == "":
             return None
         if normalized not in CATEGORY_VALUES:
-            raise ValueError(
+            raise ToolInputError(
                 f"category must be one of {list(CATEGORY_VALUES) + ['All']} "
                 f"(got {category!r}). 'Parcel' is regular taxable parcels; "
                 f"'Lease' is leased government land; 'Economic' is "
@@ -537,7 +543,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
         request exceeded the maximum -- silent clamping would leave the
         caller with no signal that records were withheld.
         """
-        requested = int(args.get("limit", default))
+        raw_limit = args.get("limit", default)
+        try:
+            requested = int(raw_limit)
+        except (TypeError, ValueError):
+            raise ToolInputError(
+                f"limit must be an integer (got {raw_limit!r})."
+            ) from None
         limit = max(1, min(requested, maximum))
         note = None
         if requested > maximum:
@@ -551,7 +563,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         """Validate a single field-name argument against the live schema."""
         field = (field or "").strip()
         if not _IDENT_RE.match(field):
-            raise ValueError(
+            raise ToolInputError(
                 f"{arg_name} must be a single field name "
                 f"(got {field!r}). {CASE_SENSITIVE_NOTE}"
             )
@@ -560,7 +572,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 field, sorted(self._live_fields), n=1, cutoff=0.6
             )
             hint = f" Did you mean {suggestion[0]!r}?" if suggestion else ""
-            raise ValueError(
+            raise ToolInputError(
                 f"{arg_name} {field!r} is not a field on the property "
                 f"layer.{hint} {CASE_SENSITIVE_NOTE}"
             )
@@ -986,14 +998,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _find_parcel(self, args: Dict[str, Any]) -> _ToolOutput:
         parcel_id = str(args.get("parcel_id") or "").strip()
         if not parcel_id:
-            raise ValueError("parcel_id is required")
+            raise ToolInputError("parcel_id is required")
         limit, clamp_note = self._clamp_limit(args, default=10, maximum=100)
         out_fields = self._validate_out_fields(args.get("out_fields"))
         category_clause = self._category_clause(args.get("category"))
 
         variants = _normalize_parcel_variants(parcel_id)
         if not variants:
-            raise ValueError(
+            raise ToolInputError(
                 f"Could not extract a parcel number from {parcel_id!r}. "
                 f"Provide an ID like '002-151-32', '00215132', "
                 f"'00215132000', or '002-151-32-000'."
@@ -1111,10 +1123,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _get_parcel_details(self, args: Dict[str, Any]) -> _ToolOutput:
         parcel_id = str(args.get("parcel_id") or "").strip()
         if not parcel_id:
-            raise ValueError("parcel_id is required")
+            raise ToolInputError("parcel_id is required")
         variants = _normalize_parcel_variants(parcel_id)
         if not variants:
-            raise ValueError(
+            raise ToolInputError(
                 f"Could not extract a parcel number from {parcel_id!r}. "
                 f"Provide an ID like '002-151-32' or '00215132000'."
             )
@@ -1353,7 +1365,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _search_by_owner(self, args: Dict[str, Any]) -> _ToolOutput:
         name = str(args.get("name") or "").strip()
         if not name:
-            raise ValueError("name is required")
+            raise ToolInputError("name is required")
         limit, clamp_note = self._clamp_limit(args, default=20, maximum=self.MAX_LIMIT)
         category_clause = self._category_clause(args.get("category"))
         owner_field = self._f("owner_name")
@@ -1417,7 +1429,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _search_by_address(self, args: Dict[str, Any]) -> _ToolOutput:
         address = str(args.get("address") or "").strip()
         if not address:
-            raise ValueError("address is required")
+            raise ToolInputError("address is required")
         limit, clamp_note = self._clamp_limit(args, default=10, maximum=100)
         needle = address.upper().replace("'", "''")
         situs_field = self._f("situs_address")
@@ -1588,12 +1600,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
             lat = float(args["lat"])
             lon = float(args["lon"])
         except (KeyError, TypeError, ValueError):
-            raise ValueError(
+            raise ToolInputError(
                 "lat and lon are required numbers (WGS84 decimal degrees, "
                 "e.g. lat=61.209, lon=-149.894)"
             )
         if not (-90.0 <= lat <= 90.0) or not (-180.0 <= lon <= 180.0):
-            raise ValueError(
+            raise ToolInputError(
                 f"lat/lon out of range (got lat={lat}, lon={lon}). "
                 f"lat must be in [-90, 90] and lon in [-180, 180]; "
                 f"Anchorage is roughly lat 61, lon -149."
@@ -1664,7 +1676,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _query_parcels(self, args: Dict[str, Any]) -> _ToolOutput:
         raw_where = str(args.get("where") or "").strip()
         if not raw_where:
-            raise ValueError("where is required (use '1=1' to match everything)")
+            raise ToolInputError("where is required (use '1=1' to match everything)")
         where = WhereValidator.validate(raw_where)
         WhereValidator.validate_against_schema(where, self._live_fields)
         out_fields = self._validate_out_fields(args.get("out_fields"))
@@ -1672,7 +1684,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=100, maximum=self.MAX_LIMIT)
         if clamp_note:
             clamp_note += " Page with offset= for more."
-        offset = max(0, int(args.get("offset", 0)))
+        raw_offset = args.get("offset", 0)
+        try:
+            offset = max(0, int(raw_offset))
+        except (TypeError, ValueError):
+            raise ToolInputError(
+                f"offset must be an integer (got {raw_offset!r})."
+            ) from None
         category_clause = self._category_clause(args.get("category"))
         full_where = self._combine_where(where, category_clause)
 
@@ -1761,7 +1779,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _parcel_stats(self, args: Dict[str, Any]) -> _ToolOutput:
         stat_type = str(args.get("stat_type") or "").strip().lower()
         if stat_type not in self.STAT_TYPES:
-            raise ValueError(
+            raise ToolInputError(
                 f"stat_type must be one of {list(self.STAT_TYPES)} "
                 f"(got {stat_type!r}). Median = percentile_cont with "
                 f"percentile=0.5."
@@ -1786,9 +1804,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
         }
         percentile = None
         if stat_type == "percentile_cont":
-            percentile = float(args.get("percentile", 0.5))
+            raw_percentile = args.get("percentile", 0.5)
+            try:
+                percentile = float(raw_percentile)
+            except (TypeError, ValueError):
+                raise ToolInputError(
+                    f"percentile must be a number between 0 and 1 "
+                    f"(got {raw_percentile!r}); 0.5 is the median."
+                ) from None
             if not (0.0 <= percentile <= 1.0):
-                raise ValueError(
+                raise ToolInputError(
                     f"percentile must be between 0 and 1 "
                     f"(got {percentile}); 0.5 is the median"
                 )
@@ -2443,7 +2468,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 structured_content=output.structured,
                 success=True,
             )
+        except ToolInputError as e:
+            # The caller passed something invalid. WARNING, no traceback:
+            # a stack trace here is noise that buries real faults, and the
+            # message alone already tells the caller how to fix the call.
+            logger.warning(f"Invalid arguments for tool {tool_name}: {e}")
+            return ToolResult(
+                content=[],
+                success=False,
+                error_message=str(e) if str(e) else "Invalid tool arguments",
+            )
         except Exception as e:
+            # Everything else IS a server or upstream fault -- keep the
+            # traceback, that is what these logs are for.
             logger.error(f"Error executing tool {tool_name}: {e}", exc_info=True)
             return ToolResult(
                 content=[],

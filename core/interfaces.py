@@ -11,6 +11,20 @@ from typing import Any, Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
+class ToolInputError(ValueError):
+    """A tool argument the CALLER got wrong.
+
+    Distinguishes "you asked for something invalid" from "this server or
+    its upstream broke". Callers of ``execute_tool`` log these at WARNING
+    with no traceback: a bad parcel number or an unparseable WHERE clause
+    is not a server incident, and a stack trace for one buries the real
+    faults in the log.
+
+    Subclasses ValueError so existing ``except ValueError`` handlers keep
+    working unchanged.
+    """
+
+
 class PluginType(str, Enum):
     """Types of plugins supported by OpenContext."""
 

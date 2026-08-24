@@ -386,10 +386,12 @@ class MCPServer:
         try:
             request = json.loads(body)
         except json.JSONDecodeError as e:
-            logger.error(
+            # A caller error: they sent something that is not JSON. -32700
+            # already tells them so; a traceback of our own json.loads adds
+            # nothing and buries genuine faults in the log.
+            logger.warning(
                 f"Invalid JSON in request body: {e}",
                 extra={"error_type": "JSONDecodeError"},
-                exc_info=True,
             )
             return {
                 "statusCode": 400,

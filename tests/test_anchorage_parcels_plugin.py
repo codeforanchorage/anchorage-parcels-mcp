@@ -16,7 +16,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
-from core.interfaces import PluginType
+from core.interfaces import PluginType, ToolInputError
 from core.plugin_manager import PluginManager
 from plugins.anchorage_parcels.config_schema import (
     DEFAULT_ADDRESSES_LAYER_URL,
@@ -1680,6 +1680,122 @@ class TestStructuredOutputConformance:
         assert structured["rows"][0]["Deed_Date"] == 1609459200000
         # ...ISO in the prose.
         assert "2021-01-01" in result.content[0]["text"]
+
+
+class TestCallerErrorLogging:
+    """Caller mistakes log at WARNING with no traceback; genuine faults
+    keep theirs.
+
+    Found in production: a client omitting a required argument wrote a
+    full Python stack trace into CloudWatch, which is indistinguishable
+    at a glance from the server actually breaking.
+    """
+
+    @staticmethod
+    def _records(caplog, level=logging.WARNING):
+        return [r for r in caplog.records if r.levelno >= level]
+
+    @pytest.mark.asyncio
+    async def test_missing_required_argument_logs_warning_no_traceback(
+        self, plugin, caplog
+    ):
+        install_client(plugin)
+        with caplog.at_level(logging.WARNING):
+            result = await run_tool(plugin, "find_parcel", {})
+
+        assert result.success is False
+        assert "parcel_id is required" in result.error_message
+        records = self._records(caplog)
+        assert records, "expected a log record"
+        assert all(r.levelno == logging.WARNING for r in records), [
+            r.levelname for r in records
+        ]
+        assert all(r.exc_info is None for r in records)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool,args,fragment",
+        [
+            ("find_parcel", {"parcel_id": "banana"}, "Could not extract"),
+            ("search_by_owner", {"name": ""}, "name is required"),
+            ("parcels_at_point", {"lat": 999, "lon": 0}, "out of range"),
+            (
+                "parcel_stats",
+                {"stat_type": "nope", "stat_field": "Lot_Size"},
+                "stat_type",
+            ),
+            (
+                "find_parcel",
+                {"parcel_id": "002-151-32", "limit": "many"},
+                "limit must be",
+            ),
+            ("query_parcels", {"where": "1=1", "offset": "x"}, "offset must be"),
+            (
+                "parcel_stats",
+                {
+                    "stat_type": "percentile_cont",
+                    "stat_field": "Lot_Size",
+                    "percentile": "half",
+                },
+                "percentile must be",
+            ),
+        ],
+    )
+    async def test_bad_arguments_never_log_a_traceback(
+        self, plugin, caplog, tool, args, fragment
+    ):
+        install_client(plugin)
+        with caplog.at_level(logging.WARNING):
+            result = await run_tool(plugin, tool, args)
+
+        assert result.success is False
+        assert fragment in result.error_message
+        assert all(r.exc_info is None for r in self._records(caplog)), (
+            f"{tool} logged a traceback for a caller error"
+        )
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+    @pytest.mark.asyncio
+    async def test_rejected_where_clause_is_a_caller_error(self, plugin, caplog):
+        """The shared ArcGIS validators reject caller input, so their
+        rejections must not read as server faults either."""
+        install_client(plugin)
+        with caplog.at_level(logging.WARNING):
+            result = await run_tool(
+                plugin, "query_parcels", {"where": "1=1; DROP TABLE parcels"}
+            )
+
+        assert result.success is False
+        assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert all(r.exc_info is None for r in self._records(caplog))
+
+    @pytest.mark.asyncio
+    async def test_upstream_fault_still_logs_error_with_traceback(self, plugin, caplog):
+        """A Feature Service returning non-JSON is NOT a caller error --
+        it must keep its ERROR level and its traceback."""
+        resp = Mock()
+        resp.status_code = 200
+        resp.headers = {"content-type": "text/html"}
+        resp.text = "<html>gateway error</html>"
+        resp.json.side_effect = ValueError("no json")
+        client = Mock()
+        client.get = AsyncMock(return_value=resp)
+        client.aclose = AsyncMock()
+        plugin.client = client
+
+        with caplog.at_level(logging.WARNING):
+            result = await run_tool(plugin, "find_parcel", {"parcel_id": "00215132000"})
+
+        assert result.success is False
+        errors = [r for r in caplog.records if r.levelno >= logging.ERROR]
+        assert errors, "an upstream fault must still log at ERROR"
+        assert any(r.exc_info is not None for r in errors), (
+            "an upstream fault must keep its traceback"
+        )
+
+    def test_tool_input_error_is_a_value_error(self):
+        """Subclassing keeps every existing `except ValueError` working."""
+        assert issubclass(ToolInputError, ValueError)
 
 
 class TestErrorHandling:
