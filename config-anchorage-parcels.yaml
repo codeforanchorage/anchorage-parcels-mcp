@@ -60,11 +60,17 @@ plugins:
     # Logical -> physical field-name overrides (see DEFAULT_FIELD_MAP in
     # plugins/anchorage_parcels/plugin.py). Empty for MOA.
     field_map: {}
-    # Per-request HTTP timeout to ArcGIS. Kept UNDER the Lambda timeout
-    # (aws.lambda_timeout below) so a hung upstream surfaces as a clean
-    # tool error the model can read, instead of the Lambda being killed
-    # mid-flight and the caller getting an opaque gateway error.
-    timeout: 25
+    # Per-request HTTP timeout to ArcGIS. Kept well UNDER the Lambda
+    # timeout (aws.lambda_timeout below) so a hung upstream surfaces as a
+    # clean tool error the model can read, instead of the Lambda being
+    # killed mid-flight and the caller getting an opaque gateway error.
+    #
+    # The full ladder: API Gateway 29s (hard) > Lambda 28s > this 20s.
+    # 20s is measured, not guessed: over 7 days of prod traffic the
+    # slowest single invocation was 17.5s and p99 was 1.75s, so this sits
+    # above every observed request while still leaving ~8s inside the
+    # Lambda to abort, format the error and return it.
+    timeout: 20
 
   ckan:
     enabled: false
