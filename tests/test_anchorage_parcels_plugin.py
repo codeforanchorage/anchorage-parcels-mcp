@@ -8,8 +8,10 @@ and error handling. All HTTP is mocked; see scripts/smoke_parcels.py
 for the live end-to-end checks.
 """
 
+import ast
 import json
 import logging
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1680,6 +1682,98 @@ class TestStructuredOutputConformance:
         assert structured["rows"][0]["Deed_Date"] == 1609459200000
         # ...ISO in the prose.
         assert "2021-01-01" in result.content[0]["text"]
+
+
+class TestErrorClassificationDoesNotDrift:
+    """Static guards so a new raise or coercion has to be classified
+    deliberately rather than silently becoming log noise.
+
+    From the anchorage-gis port of this work: a scripted caller/upstream
+    split misfiled two CALLER errors as upstream faults because their
+    help text happened to mention "upstream portal", and a line-oriented
+    search for numeric coercion found only 4 of 16 sites -- nine were
+    inline expressions a regex cannot see.
+    """
+
+    PLUGIN_SRC = Path(__file__).resolve().parents[1] / (
+        "plugins/anchorage_parcels/plugin.py"
+    )
+    VALIDATOR_SRC = Path(__file__).resolve().parents[1] / (
+        "plugins/arcgis/where_validator.py"
+    )
+
+    def test_only_the_upstream_fault_raises_a_plain_value_error(self):
+        """Exactly one plain ValueError: the Feature Service returning
+        non-JSON. Everything else the caller can cause is a
+        ToolInputError, which logs at WARNING with no traceback."""
+        src = self.PLUGIN_SRC.read_text(encoding="utf-8")
+        assert src.count("raise ValueError(") == 1, (
+            "a new plain ValueError was added to the parcels plugin -- "
+            "classify it deliberately: caller mistake -> ToolInputError, "
+            "genuine upstream/server fault -> ValueError (keeps its "
+            "traceback)"
+        )
+        assert "Feature Service returned non-JSON" in src
+
+    def test_shared_validators_only_raise_caller_errors(self):
+        """WHERE / order_by / out_fields rejections are always the
+        caller's fault, never the server's."""
+        src = self.VALIDATOR_SRC.read_text(encoding="utf-8")
+        assert src.count("raise ValueError(") == 0, (
+            "the ArcGIS validators only ever reject caller input; a plain "
+            "ValueError here would be logged as a server fault"
+        )
+
+    def test_every_numeric_coercion_of_caller_input_is_guarded(self):
+        """AST sweep, not a regex.
+
+        A line-oriented search misses inline forms like
+        `min(int(arguments.get("limit", 20)), 100)`, which is how most of
+        the sites hid in the sibling repo.
+        """
+        src = self.PLUGIN_SRC.read_text(encoding="utf-8")
+        tree = ast.parse(src)
+
+        # Line numbers sitting inside a try whose handler raises
+        # ToolInputError, or which degrades gracefully instead of raising.
+        guarded = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            handled = any(
+                isinstance(h, ast.ExceptHandler)
+                and (
+                    "ToolInputError" in ast.unparse(h)
+                    or "ValueError" in ast.unparse(h.type or ast.Constant(""))
+                )
+                for h in node.handlers
+            )
+            if handled:
+                for stmt in node.body:
+                    for sub in ast.walk(stmt):
+                        if hasattr(sub, "lineno"):
+                            guarded.add(sub.lineno)
+
+        unguarded = []
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("int", "float")
+            ):
+                inner = ast.unparse(node)
+                touches_caller_input = any(
+                    tok in inner for tok in ("args.get", "arguments.get", "args[")
+                )
+                if touches_caller_input and node.lineno not in guarded:
+                    unguarded.append(f"line {node.lineno}: {inner}")
+
+        assert not unguarded, (
+            "numeric coercion of caller input outside a guard -- a bare "
+            "int()/float() raises a stdlib ValueError, which logs as a "
+            "server fault and tells the caller nothing useful:\n  "
+            + "\n  ".join(unguarded)
+        )
 
 
 class TestCallerErrorLogging:
