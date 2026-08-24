@@ -1694,6 +1694,115 @@ class TestStructuredOutputConformance:
         assert "2021-01-01" in result.content[0]["text"]
 
 
+class TestEmptyColumnRendering:
+    """A page where the requested fields are all null used to render a
+    grid of `| | Parcel` rows -- thousands of tokens, zero information."""
+
+    @pytest.mark.asyncio
+    async def test_all_null_page_collapses_to_one_line(self, plugin):
+        shells = [
+            feat(Parcel_ID=None, Parcel_Address=None, GIS_Category="Parcel")
+            for _ in range(50)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1023}),
+                (is_feature_query, {"features": shells}),
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "query_parcels",
+            {
+                "where": "1=1",
+                "out_fields": "Parcel_ID,Parcel_Address,GIS_Category",
+                "include_unassessed": True,
+                "limit": 50,
+            },
+        )
+        text = tool_text(result)
+        assert "ALL requested fields" in text
+        assert "Parcel_ID" in text and "Parcel_Address" in text
+        assert "TOTAL COUNT: 1,023" in text
+        assert "include_unassessed" in text
+        # The grid must not be rendered at all.
+        assert "Compact format" not in text
+        assert "| | Parcel" not in text
+        # One line, not fifty rows.
+        assert text.count("Parcel_ID") <= 3, text[-400:]
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert any(c["code"] == "all_fields_null" for c in structured["caveats"])
+        # The rows themselves are still returned for a caller that wants them.
+        assert len(structured["rows"]) == 50
+
+    @pytest.mark.asyncio
+    async def test_category_alone_does_not_count_as_information(self, plugin):
+        """GIS_Category is populated even on shells; it must not on its own
+        make an empty page look informative."""
+        shells = [feat(Parcel_ID=None, GIS_Category="Parcel") for _ in range(30)]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 30}),
+                (is_feature_query, {"features": shells}),
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "query_parcels",
+            {"where": "1=1", "include_unassessed": True, "limit": 30},
+        )
+        assert "ALL requested fields" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_partially_null_columns_are_dropped_and_named(self, plugin):
+        records = [
+            feat(
+                Parcel_ID=f"0021513200{i}",
+                Parcel_Address=None,
+                Land_Use=None,
+                GIS_Category="Parcel",
+            )
+            for i in range(30)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 30}),
+                (is_feature_query, {"features": records}),
+            ],
+        )
+        result = await run_tool(plugin, "query_parcels", {"where": "1=1", "limit": 30})
+        text = tool_text(result)
+        # Still a table -- Parcel_ID carries information.
+        assert "Compact format" in text
+        assert "Columns omitted" in text
+        assert "Parcel_Address" in text and "Land_Use" in text
+        # ...but the dead columns are gone from the header row.
+        header = [ln for ln in text.splitlines() if ln.startswith("Parcel_ID")][0]
+        assert "Parcel_Address" not in header
+        assert "Land_Use" not in header
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert any(c["code"] == "empty_columns_dropped" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_fully_populated_page_is_unchanged(self, plugin):
+        records = [feat(**SAMPLE_RECORD) for _ in range(30)]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 30}),
+                (is_feature_query, {"features": records}),
+            ],
+        )
+        result = await run_tool(plugin, "query_parcels", {"where": "1=1", "limit": 30})
+        text = tool_text(result)
+        assert "Compact format" in text
+        assert "Columns omitted" not in text
+        assert "ALL requested fields" not in text
+
+
 class TestUnassessedFilter:
     """~1,000 features are geometry-only shells with no assessment join.
 

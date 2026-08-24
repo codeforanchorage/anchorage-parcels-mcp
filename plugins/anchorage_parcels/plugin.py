@@ -170,6 +170,8 @@ CAVEAT_CODES = (
     "point_outside_parcels",  # the point falls in no property polygon
     "stacked_categories",  # Parcel/Lease/Economic polygons overlap here
     "unassessed_included",  # geometry-only shell records were NOT filtered out
+    "all_fields_null",  # every requested field is empty on every row
+    "empty_columns_dropped",  # columns null across the whole page, omitted
 )
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -953,17 +955,51 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"use it directly instead of counting the records below."
             )
         lines.append("")
+
+        columns = self._ordered_columns(records)
+        empty_columns = self._all_null_columns(records, columns)
+        # The category discriminator is structural -- it is populated on
+        # every row including the unassessed shells, so it must not on its
+        # own make a page of empty records look informative.
+        category_field = self._f("category")
+        substantive = [c for c in columns if c != category_field]
+
+        if substantive and all(c in empty_columns for c in substantive):
+            # Every field the caller actually asked for is empty on every
+            # row. Rendering the grid would cost thousands of tokens to say
+            # nothing; say it in one line instead.
+            message = (
+                f"{len(records):,} record(s) matched but ALL requested "
+                f"fields ({', '.join(substantive)}) are null for every "
+                f"record on this page."
+            )
+            if total_count is not None:
+                message += f" TOTAL COUNT: {total_count:,}."
+            message += (
+                " Try different out_fields, or see `include_unassessed` "
+                "in the tool description -- these are most likely "
+                "geometry-only records with no assessment data."
+            )
+            caveats.add("all_fields_null", message)
+            lines.append(message)
+            return "\n".join(lines)
+
+        if empty_columns:
+            # Drop columns that are null on every row rather than
+            # rendering an all-empty column once per record.
+            columns = [c for c in columns if c not in empty_columns]
+            caveats.add(
+                "empty_columns_dropped",
+                f"Columns omitted because they are null for every record "
+                f"on this page: {', '.join(empty_columns)}.",
+            )
+            lines.append(caveats.messages[-1])
+            lines.append("")
+
         if len(records) > self.COMPACT_FORMAT_THRESHOLD:
             # Large result sets: pipe-delimited table (header row +
             # one row per record) instead of per-record blocks, which
             # cost ~3x the bytes of the data they carry.
-            columns: List[str] = list(records[0].keys())
-            seen = set(columns)
-            for record in records[1:]:
-                for key in record:
-                    if key not in seen:
-                        seen.add(key)
-                        columns.append(key)
             lines.append(
                 f"(Compact format: {len(records)} records, one "
                 f"pipe-delimited row each; the first row is the header.)"
@@ -980,10 +1016,31 @@ class AnchorageParcelsPlugin(MCPPlugin):
         else:
             for i, record in enumerate(records, 1):
                 lines.append(f"Record {i}:")
-                for key, value in record.items():
-                    lines.append(f"  {key}: {self._render_value(key, value)}")
+                for key in columns:
+                    lines.append(f"  {key}: {self._render_value(key, record.get(key))}")
                 lines.append("")
         return "\n".join(lines)
+
+    @staticmethod
+    def _ordered_columns(records: List[Dict[str, Any]]) -> List[str]:
+        """Union of keys across records, preserving first-seen order."""
+        columns: List[str] = []
+        seen = set()
+        for record in records:
+            for key in record:
+                if key not in seen:
+                    seen.add(key)
+                    columns.append(key)
+        return columns
+
+    @staticmethod
+    def _all_null_columns(
+        records: List[Dict[str, Any]], columns: List[str]
+    ) -> List[str]:
+        """Columns whose value is null/empty on EVERY row of this page."""
+        return [
+            c for c in columns if all(record.get(c) in (None, "") for record in records)
+        ]
 
     @staticmethod
     def _table_cell(value: Any) -> str:
