@@ -3,54 +3,54 @@
 
 import asyncio
 import json
-from pathlib import Path
+import uuid
 
-import yaml
 from aiohttp import web
 
-from core.plugin_manager import PluginManager
-from core.mcp_server import MCPServer
+from server import http_handler
+from server.http_handler import UniversalHTTPHandler
 
-# Load config
-with open("config.yaml") as f:
-    config = yaml.safe_load(f)
-
-# Global server instance
-_plugin_manager = None
-_mcp_server = None
+# Shared handler instance -- the SAME class the Lambda adapter drives, so
+# this entry point gets the Origin allowlist and MCP-Protocol-Version
+# checks instead of a parallel path that skips them.
+_handler = UniversalHTTPHandler()
 
 
 async def init_server():
     """Initialize server on startup."""
-    global _plugin_manager, _mcp_server
-
     print("🚀 Initializing OpenContext MCP Server locally...")
 
-    # Initialize Plugin Manager
-    _plugin_manager = PluginManager(config)
-    await _plugin_manager.load_plugins()
-
-    # Initialize MCP Server
-    _mcp_server = MCPServer(_plugin_manager)
+    await http_handler._initialize_server()
+    plugin_manager = http_handler._plugin_manager
 
     print("✅ Server initialized successfully")
-    print(f"Loaded plugins: {list(_plugin_manager.plugins.keys())}")
-    print(f"Available tools: {len(_plugin_manager.get_all_tools())}")
+    print(f"Loaded plugins: {list(plugin_manager.plugins.keys())}")
+    print(f"Available tools: {len(plugin_manager.get_all_tools())}")
 
 
 async def handle_mcp_request(request):
     """Handle MCP JSON-RPC request."""
     try:
         body = await request.text()
-        headers = dict(request.headers)
+        # Lowercased to match what the Lambda adapter normalizes to.
+        headers = {k.lower(): v for k, v in request.headers.items()}
 
-        # Use the same handler as Lambda
-        response = await _mcp_server.handle_http_request(body, headers)
+        # This entry point has historically also served "/"; the shared
+        # handler only routes MCP paths, so map it onto /mcp.
+        path = "/mcp" if request.path == "/" else request.path
+
+        status_code, response_headers, response_body = await _handler.handle_request(
+            method=request.method,
+            path=path,
+            body=body,
+            headers=headers,
+            request_id=str(uuid.uuid4()),
+        )
 
         return web.Response(
-            text=response.get("body", "{}"),
-            status=response.get("statusCode", 200),
-            headers=response.get("headers", {}),
+            text=response_body,
+            status=status_code,
+            headers=response_headers,
         )
 
     except Exception as e:
@@ -94,7 +94,8 @@ async def start_server():
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
-        await _plugin_manager.shutdown()
+        if http_handler._plugin_manager is not None:
+            await http_handler._plugin_manager.shutdown()
 
 
 if __name__ == "__main__":

@@ -19,9 +19,9 @@ import yaml
 from aiohttp import web
 
 from core.logging_utils import configure_json_logging
-from core.mcp_server import MCPServer
-from core.plugin_manager import PluginManager
 from core.validators import get_logging_config
+from server import http_handler
+from server.http_handler import UniversalHTTPHandler
 
 logger = logging.getLogger(__name__)
 
@@ -37,27 +37,24 @@ configure_json_logging(
     pretty=True,  # Pretty-print JSON for better local readability
 )
 
-# Global server instance
-_plugin_manager = None
-_mcp_server = None
+# Shared handler instance -- the SAME class the Lambda adapter drives, so
+# local dev exercises the Origin allowlist, the MCP-Protocol-Version check
+# and the routing rules rather than a parallel code path that skips them.
+_handler = UniversalHTTPHandler()
 
 
 async def init_server():
     """Initialize server on startup."""
-    global _plugin_manager, _mcp_server
-
     print("🚀 Initializing OpenContext MCP Server locally...")
 
-    # Initialize Plugin Manager
-    _plugin_manager = PluginManager(config)
-    await _plugin_manager.load_plugins()
-
-    # Initialize MCP Server
-    _mcp_server = MCPServer(_plugin_manager)
+    # Warm the handler's plugin manager / MCP server so a bad config
+    # fails at startup instead of on the first request.
+    await http_handler._initialize_server()
+    plugin_manager = http_handler._plugin_manager
 
     print("✅ Server initialized successfully")
-    print(f"Loaded plugins: {list(_plugin_manager.plugins.keys())}")
-    print(f"Available tools: {len(_plugin_manager.get_all_tools())}")
+    print(f"Loaded plugins: {list(plugin_manager.plugins.keys())}")
+    print(f"Available tools: {len(plugin_manager.get_all_tools())}")
 
 
 async def handle_mcp_request(request):
@@ -65,10 +62,13 @@ async def handle_mcp_request(request):
     start_time = time.perf_counter()
     try:
         body = await request.text()
-        headers = dict(request.headers)
+        # The shared handler expects lowercased header names, matching what
+        # the Lambda adapter normalizes to. aiohttp's own lookups are
+        # case-insensitive, but dict() preserves the wire casing.
+        headers = {k.lower(): v for k, v in request.headers.items()}
 
         # Extract session ID from headers for logging
-        session_id = headers.get("mcp-session-id") or headers.get("Mcp-Session-Id")
+        session_id = headers.get("mcp-session-id")
 
         # Parse JSON to detect method and extract details for logging
         try:
@@ -97,40 +97,35 @@ async def handle_mcp_request(request):
             },
         )
 
-        # Check if this is an initialize request
-        is_initialize = method == "initialize"
-        session_id_to_return = None
-
-        if is_initialize:
-            session_id_to_return = str(uuid.uuid4())
-            logger.info(
-                f"Initialize request detected, generating session ID: {session_id_to_return}"
-            )
-
-        # Use the same handler as Lambda
-        response = await _mcp_server.handle_http_request(body, headers)
-
-        # Add session ID to response headers if this was an initialize request
-        response_headers = dict(response.get("headers", {}))
-        if session_id_to_return:
-            response_headers["Mcp-Session-Id"] = session_id_to_return
+        # Drive the SAME handler the Lambda adapter drives -- including
+        # the Origin allowlist, the MCP-Protocol-Version check, path/method
+        # routing and session-ID generation. Previously this called the
+        # inner MCP server directly, so a regression in any of those was
+        # invisible locally and only showed up in a deployed environment.
+        status_code, response_headers, response_body = await _handler.handle_request(
+            method=request.method,
+            path=request.path,
+            body=body,
+            headers=headers,
+            request_id=str(uuid.uuid4()),
+        )
 
         # Calculate and log response time
         duration_ms = (time.perf_counter() - start_time) * 1000
         logger.info(
             "MCP request processed",
             extra={
-                "session_id": session_id_to_return or session_id,
+                "session_id": response_headers.get("Mcp-Session-Id") or session_id,
                 "method": method,
                 "tool_name": tool_name,
                 "duration_ms": round(duration_ms, 2),
-                "status_code": response.get("statusCode", 200),
+                "status_code": status_code,
             },
         )
 
         return web.Response(
-            text=response.get("body", "{}"),
-            status=response.get("statusCode", 200),
+            text=response_body,
+            status=status_code,
             headers=response_headers,
         )
 
@@ -154,12 +149,24 @@ async def handle_mcp_request(request):
         )
 
 
+async def handle_options_request(request):
+    """Handle a CORS preflight through the shared handler."""
+    status_code, response_headers, response_body = _handler.handle_options(
+        request_id=str(uuid.uuid4()),
+        request_origin=request.headers.get("Origin"),
+    )
+    return web.Response(
+        text=response_body, status=status_code, headers=response_headers
+    )
+
+
 async def start_server():
     """Start local HTTP server."""
     await init_server()
 
     app = web.Application()
     app.router.add_post("/mcp", handle_mcp_request)
+    app.router.add_options("/mcp", handle_options_request)
 
     runner = web.AppRunner(app)
     await runner.setup()
@@ -221,7 +228,8 @@ async def start_server():
         await asyncio.Event().wait()
     except KeyboardInterrupt:
         print("\n👋 Shutting down...")
-        await _plugin_manager.shutdown()
+        if http_handler._plugin_manager is not None:
+            await http_handler._plugin_manager.shutdown()
 
 
 if __name__ == "__main__":

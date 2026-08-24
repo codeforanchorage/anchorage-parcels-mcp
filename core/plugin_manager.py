@@ -218,6 +218,19 @@ class PluginManager:
 
         logger.info(f"Registered {len(tools)} tools from plugin {plugin_name}")
 
+    def has_tool(self, tool_name: str) -> bool:
+        """Whether a fully-prefixed tool name is registered.
+
+        Callers use this to distinguish "no such tool" (a caller error
+        the MCP layer reports as JSON-RPC -32602) from a tool that exists
+        but failed while running.
+        """
+        return tool_name in self.tools
+
+    def list_tool_names(self) -> List[str]:
+        """Registered tool names, sorted, for error messages and clients."""
+        return sorted(self.tools.keys())
+
     async def execute_tool(
         self, tool_name: str, arguments: Dict[str, Any]
     ) -> ToolResult:
