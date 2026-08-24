@@ -24,7 +24,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import httpx
 
@@ -146,7 +146,166 @@ CATEGORY_VALUES = ("Parcel", "Lease", "Economic")
 
 CASE_SENSITIVE_NOTE = "Field names are case-sensitive."
 
+# Stable machine-readable codes for the warnings a tool response carries.
+# A caller branches on `code` instead of pattern-matching prose that may
+# be reworded. The prose banner and the structured entry are generated
+# from ONE list (see `_Caveats`), so the two cannot drift apart.
+CAVEAT_CODES = (
+    "limit_clamped",  # requested limit exceeded the tool maximum
+    "results_truncated",  # more records match than were returned
+    "list_truncated",  # the disambiguation list itself was cut short
+    "more_pages_available",  # page on with offset=
+    "no_results",  # nothing matched
+    "fuzzy_match",  # rows are LIKE candidates, NOT exact matches
+    "no_fuzzy_candidates",  # not even a fuzzy fallback hit
+    "multiple_records",  # the ID resolves to several records (condos)
+    "address_point_fallback",  # resolved via address layer + point-in-polygon
+    "no_address_match",  # neither situs nor address-point matched
+    "point_outside_parcels",  # the point falls in no property polygon
+    "stacked_categories",  # Parcel/Lease/Economic polygons overlap here
+)
+
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+class _Caveats:
+    """Warnings for one tool response, rendered into BOTH output forms.
+
+    Every warning is added here exactly once. The prose banner and the
+    ``caveats`` array in structuredContent are both derived from this
+    list, which is what stops the human-readable text and the
+    machine-readable contract from drifting apart as either is edited.
+    """
+
+    def __init__(self) -> None:
+        self._items: List[Dict[str, str]] = []
+
+    def add(self, code: str, message: Optional[str]) -> None:
+        """Record a warning. A falsy message is ignored, so callers can
+        pass an optional notice straight through."""
+        if message:
+            self._items.append({"code": code, "message": message})
+
+    def add_first(self, code: str, message: Optional[str]) -> None:
+        """Like `add`, but placed ahead of everything already recorded."""
+        if message:
+            self._items.insert(0, {"code": code, "message": message})
+
+    @property
+    def messages(self) -> List[str]:
+        """The prose lines, in order."""
+        return [item["message"] for item in self._items]
+
+    def as_list(self) -> List[Dict[str, str]]:
+        return [dict(item) for item in self._items]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+class _ToolOutput(NamedTuple):
+    """What a tool handler returns: prose for the model, data for code."""
+
+    text: str
+    structured: Optional[Dict[str, Any]] = None
+
+
+# ── Output schemas ────────────────────────────────────────────────────
+#
+# A declared outputSchema is BINDING -- the spec says servers MUST return
+# conforming structured results. These are deliberately loose where the
+# real data is loose: rows carry whatever out_fields the caller asked
+# for, statistic values can come back as strings (min/max over a text
+# field) or null, and record counts are null when the count endpoint
+# fails. A schema written from the happy path would make the server
+# violate its own contract on live data.
+
+_CAVEATS_SCHEMA: Dict[str, Any] = {
+    "type": "array",
+    "description": (
+        "Warnings about this result. Branch on `code` rather than "
+        "parsing the prose; every entry here also appears verbatim in "
+        "the text content."
+    ),
+    "items": {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "enum": list(CAVEAT_CODES)},
+            "message": {"type": "string"},
+        },
+        "required": ["code", "message"],
+        "additionalProperties": False,
+    },
+}
+
+_ROW_SCHEMA: Dict[str, Any] = {
+    "type": "object",
+    "description": (
+        "One record: RAW layer attributes keyed by physical field name. "
+        "Which fields are present depends on out_fields. Date fields are "
+        "epoch milliseconds -- summary.date_fields_epoch_ms names them."
+    ),
+    "additionalProperties": True,
+}
+
+_SUMMARY_BASE_PROPS: Dict[str, Any] = {
+    "date_fields_epoch_ms": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": (
+            "Fields in `rows`/`result` whose raw value is epoch "
+            "milliseconds. The prose renders these as ISO dates; the "
+            "structured values are left raw."
+        ),
+    },
+}
+
+_NULLABLE_COUNT: Dict[str, Any] = {
+    "type": ["integer", "null"],
+    "description": (
+        "Null when the count could not be established (the count "
+        "endpoint failed or was not consulted) -- which is NOT the same "
+        "as zero."
+    ),
+}
+
+
+def _envelope_schema(
+    description: str,
+    query_props: Dict[str, Any],
+    summary_props: Dict[str, Any],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build one tool's output schema around the shared envelope.
+
+    `payload` names the result-carrying keys (rows, or result +
+    candidates) so a model learns one shape across the whole server.
+    """
+    properties: Dict[str, Any] = {
+        "query": {
+            "type": "object",
+            "description": "What was asked, as the server resolved it.",
+            "properties": query_props,
+            "additionalProperties": True,
+        },
+        "summary": {
+            "type": "object",
+            "description": "Counts and outcome flags for this result.",
+            "properties": {**_SUMMARY_BASE_PROPS, **summary_props},
+            "additionalProperties": True,
+        },
+        "caveats": _CAVEATS_SCHEMA,
+    }
+    properties.update(payload)
+    return {
+        "type": "object",
+        "description": description,
+        "properties": properties,
+        # Every declared key is required on every code path; extra keys
+        # stay legal so a later addition is not a contract violation.
+        "required": ["query", "summary", "caveats", *payload],
+        "additionalProperties": True,
+    }
 
 
 class AnchorageParcelsPlugin(MCPPlugin):
@@ -176,6 +335,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
     # Above this many records, _format_records switches from per-record
     # blocks to a compact pipe-delimited table.
     COMPACT_FORMAT_THRESHOLD = 20
+    # Max stacked polygons returned for one point-in-polygon lookup.
+    POINT_QUERY_LIMIT = 20
 
     SCHEMA_SNAPSHOT_PATH = Path(__file__).parent / "schema" / "propertyinformation.json"
 
@@ -645,6 +806,50 @@ class AnchorageParcelsPlugin(MCPPlugin):
         lines.append(f"Retrieved: {retrieved_at}")
         return lines
 
+    def _date_field_names(self) -> List[str]:
+        """Fields whose RAW value is epoch milliseconds.
+
+        Structured output carries raw values; this is the decode map a
+        consumer needs to turn them into dates. The prose rendering
+        converts them to ISO, the structured rows deliberately do not.
+        """
+        if self._date_fields:
+            return sorted(self._date_fields)
+        return sorted({self._f("deed_date"), self._f("pub_date")})
+
+    def _envelope(
+        self,
+        query: Dict[str, Any],
+        summary: Dict[str, Any],
+        caveats: "_Caveats",
+        **payload: Any,
+    ) -> Dict[str, Any]:
+        """Assemble the {query, summary, <payload>, caveats} envelope.
+
+        One shape across every tool, so a model that learns it once can
+        read any of them. `payload` is `rows=` for list tools, or
+        `result=` + `candidates=` for the single-record tool.
+        """
+        envelope: Dict[str, Any] = {
+            "query": query,
+            "summary": {
+                "date_fields_epoch_ms": self._date_field_names(),
+                **summary,
+            },
+            "caveats": caveats.as_list(),
+        }
+        envelope.update(payload)
+        return envelope
+
+    @staticmethod
+    def _render_caveats(lines: List[str], caveats: "_Caveats") -> None:
+        """Render every caveat into the prose.
+
+        Called on EVERY return path so that anything in structured
+        `caveats` is also visible to a model reading the text.
+        """
+        lines.extend(caveats.messages)
+
     def _render_value(self, key: str, value: Any) -> Any:
         if value is None or value == "":
             return value
@@ -662,27 +867,33 @@ class AnchorageParcelsPlugin(MCPPlugin):
         where: Optional[str] = None,
         out_fields: Optional[str] = None,
         heading: Optional[str] = None,
-        notices: Optional[List[str]] = None,
+        caveats: Optional["_Caveats"] = None,
     ) -> str:
         """List records with provenance header, TOTAL COUNT line, and a
         truncation banner (conventions from anchorage_gis
-        `_format_query_results`). Extra caller banners (e.g. the
-        LIMIT CLAMPED notice) go in `notices`, right after TRUNCATED."""
+        `_format_query_results`).
+
+        All banners -- the truncation notice raised here and any the
+        caller already recorded (LIMIT CLAMPED, MORE PAGES, ...) -- come
+        from the single `caveats` list, which is also what structured
+        output serialises. Text and structuredContent therefore cannot
+        disagree about what went wrong."""
+        caveats = caveats if caveats is not None else _Caveats()
         lines = self._provenance(where=where, out_fields=out_fields, limit=limit)
         truncated = (
             total_count is not None and len(records) > 0 and total_count > len(records)
         )
         if truncated:
-            lines.append(
+            caveats.add_first(
+                "results_truncated",
                 f"**TRUNCATED:** returned {len(records)} of "
                 f"{total_count:,} matching records (limit={limit}). The "
                 f"records below are a SAMPLE -- do not generalize counts "
                 f"or totals from them. Use the TOTAL COUNT line below for "
                 f"'how many?' questions, or page with offset / narrow the "
-                f"WHERE clause."
+                f"WHERE clause.",
             )
-        if notices:
-            lines.extend(notices)
+        self._render_caveats(lines, caveats)
         lines.append("")
         if heading:
             lines.append(heading)
@@ -772,7 +983,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
     # ── Tool: find_parcel ─────────────────────────────────────────────
 
-    async def _find_parcel(self, args: Dict[str, Any]) -> str:
+    async def _find_parcel(self, args: Dict[str, Any]) -> _ToolOutput:
         parcel_id = str(args.get("parcel_id") or "").strip()
         if not parcel_id:
             raise ValueError("parcel_id is required")
@@ -793,6 +1004,17 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         where = self._combine_where(f"({exact_clause})", category_clause)
 
+        caveats = _Caveats()
+        caveats.add("limit_clamped", clamp_note)
+        query = {
+            "parcel_id": parcel_id,
+            "category": args.get("category"),
+            "out_fields": out_fields,
+            "limit": limit,
+            "where": where,
+            "variants_tried": variants,
+        }
+
         records, _ = await self._query_property_layer(where, out_fields, limit)
         if records:
             heading = (
@@ -802,13 +1024,22 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 + ", ".join(f"`{v}`" for v in variants)
                 + "\n"
             )
-            return self._format_records(
+            text = self._format_records(
                 records,
                 limit,
                 where=where,
                 out_fields=out_fields,
                 heading=heading,
-                notices=[clamp_note] if clamp_note else None,
+                caveats=caveats,
+            )
+            return _ToolOutput(
+                text,
+                self._envelope(
+                    query,
+                    {"returned_count": len(records), "exact_match": True},
+                    caveats,
+                    rows=records,
+                ),
             )
 
         # Zero exact hits -> LIKE fallback on the 11-digit column with a
@@ -837,11 +1068,23 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "",
         ]
         if candidates:
-            lines.append(
+            caveats.add(
+                "fuzzy_match",
                 f"**FUZZY candidates** (LIKE '%{substring}%' on "
                 f"{self._f('parcel_id')} -- these are NOT exact matches, "
-                f"verify before using):"
+                f"verify before using):",
             )
+        else:
+            caveats.add(
+                "no_fuzzy_candidates",
+                "No fuzzy candidates either. The parcel may not exist, "
+                "or it may be filed under a different category -- retry "
+                "with category='All'.",
+            )
+        # Render every caveat, so nothing in structured output is absent
+        # from the text a model actually reads.
+        self._render_caveats(lines, caveats)
+        if candidates:
             lines.append("")
             for c in candidates:
                 pid = c.get(self._f("parcel_id"))
@@ -853,17 +1096,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "_Pick the right candidate and call get_parcel_details "
                 "with its exact ID._"
             )
-        else:
-            lines.append(
-                "No fuzzy candidates either. The parcel may not exist, "
-                "or it may be filed under a different category -- retry "
-                "with category='All'."
-            )
-        return "\n".join(lines)
+        return _ToolOutput(
+            "\n".join(lines),
+            self._envelope(
+                query,
+                {"returned_count": len(candidates), "exact_match": False},
+                caveats,
+                rows=candidates,
+            ),
+        )
 
     # ── Tool: get_parcel_details ──────────────────────────────────────
 
-    async def _get_parcel_details(self, args: Dict[str, Any]) -> str:
+    async def _get_parcel_details(self, args: Dict[str, Any]) -> _ToolOutput:
         parcel_id = str(args.get("parcel_id") or "").strip()
         if not parcel_id:
             raise ValueError("parcel_id is required")
@@ -880,13 +1125,37 @@ class AnchorageParcelsPlugin(MCPPlugin):
             + ")"
         )
 
+        caveats = _Caveats()
+        query = {
+            "parcel_id": parcel_id,
+            "where": where,
+            "variants_tried": variants,
+        }
+
         records, _ = await self._query_property_layer(where, "*", 2)
         if not records:
-            return (
+            # Zero-result branch: it MUST still emit conforming
+            # structured content, not short-circuit past it.
+            caveats.add(
+                "no_results",
                 f"No property record found for `{parcel_id}`. "
                 f"Try `find_parcel('{parcel_id}')` -- it adds a fuzzy "
                 f"fallback and can search Lease/Economic records with "
-                f"category='All'."
+                f"category='All'.",
+            )
+            return _ToolOutput(
+                "\n".join(caveats.messages),
+                self._envelope(
+                    query,
+                    {
+                        "match_count": 0,
+                        "match_count_is_lower_bound": False,
+                        "resolved": False,
+                    },
+                    caveats,
+                    result=None,
+                    candidates=[],
+                ),
             )
         if len(records) > 1:
             # Condos share a parcel root; Parcel_ID_Count > 1 marks it.
@@ -913,13 +1182,24 @@ class AnchorageParcelsPlugin(MCPPlugin):
             )
             if total is None:
                 total = f"{len(records)}+" if exceeded else len(records)
-            lines = [
+            # `total` is a "N+" string when the count endpoint failed and
+            # the page was capped. Structured output keeps the number and
+            # the fact that it is only a lower bound in separate fields
+            # rather than shipping a string where a count belongs.
+            if isinstance(total, int):
+                match_count, is_lower_bound = total, False
+            else:
+                match_count, is_lower_bound = len(records), True
+            caveats.add(
+                "multiple_records",
                 f"`{parcel_id}` matches {total} records (condo "
                 f"units and lease/economic overlays share parcel roots). "
                 f"Which unit do you want? Pass the exact 11-digit "
                 f"{self._f('parcel_id')} to get_parcel_details:",
-                "",
-            ]
+            )
+            lines: List[str] = []
+            self._render_caveats(lines, caveats)
+            lines.append("")
             for r in records:
                 lines.append(
                     f"- `{r.get(self._f('parcel_id'))}` "
@@ -929,14 +1209,29 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"{r.get(self._f('owner_name'))}"
                 )
             if exceeded or (isinstance(total, int) and total > len(records)):
-                lines.append("")
-                lines.append(
+                truncation = (
                     f"**LIST TRUNCATED:** showing the first "
                     f"{len(records)} of {total} matching records. Page "
                     f"through the rest with query_parcels using the "
                     f"same parcel number and an offset."
                 )
-            return "\n".join(lines)
+                caveats.add("list_truncated", truncation)
+                lines.append("")
+                lines.append(truncation)
+            return _ToolOutput(
+                "\n".join(lines),
+                self._envelope(
+                    query,
+                    {
+                        "match_count": match_count,
+                        "match_count_is_lower_bound": is_lower_bound,
+                        "resolved": False,
+                    },
+                    caveats,
+                    result=None,
+                    candidates=records,
+                ),
+            )
 
         r = records[0]
 
@@ -1036,11 +1331,26 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "",
                 f"**Full assessor record (Datalet):** {datalet}",
             ]
-        return "\n".join(lines)
+        return _ToolOutput(
+            "\n".join(lines),
+            self._envelope(
+                query,
+                {
+                    "match_count": 1,
+                    "match_count_is_lower_bound": False,
+                    "resolved": True,
+                },
+                caveats,
+                # The RAW record, every field the layer returned -- not
+                # the subset the prose above chose to render.
+                result=r,
+                candidates=[],
+            ),
+        )
 
     # ── Tool: search_by_owner ─────────────────────────────────────────
 
-    async def _search_by_owner(self, args: Dict[str, Any]) -> str:
+    async def _search_by_owner(self, args: Dict[str, Any]) -> _ToolOutput:
         name = str(args.get("name") or "").strip()
         if not name:
             raise ValueError("name is required")
@@ -1058,6 +1368,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
         (records, _), total = await asyncio.gather(
             records_task, self._fetch_count(where)
         )
+        caveats = _Caveats()
+        caveats.add("limit_clamped", clamp_note)
+        if not records:
+            caveats.add(
+                "no_results",
+                f"No parcel has an owner name matching `{name}`.",
+            )
         text = self._format_records(
             records,
             limit,
@@ -1068,15 +1385,36 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"## Parcels with owner matching `{name}` "
                 f"(ordered by appraised value, highest first)\n"
             ),
-            notices=[clamp_note] if clamp_note else None,
+            caveats=caveats,
         )
         if not records:
             text += self._no_data_hint(where)
-        return text
+        return _ToolOutput(
+            text,
+            self._envelope(
+                {
+                    "name": name,
+                    "category": args.get("category"),
+                    "where": where,
+                    "out_fields": self._summary_fields,
+                    "order_by": order_by,
+                    "limit": limit,
+                },
+                {
+                    "returned_count": len(records),
+                    "total_count": total,
+                    "truncated": bool(
+                        total is not None and records and total > len(records)
+                    ),
+                },
+                caveats,
+                rows=records,
+            ),
+        )
 
     # ── Tool: search_by_address ───────────────────────────────────────
 
-    async def _search_by_address(self, args: Dict[str, Any]) -> str:
+    async def _search_by_address(self, args: Dict[str, Any]) -> _ToolOutput:
         address = str(args.get("address") or "").strip()
         if not address:
             raise ValueError("address is required")
@@ -1085,11 +1423,20 @@ class AnchorageParcelsPlugin(MCPPlugin):
         situs_field = self._f("situs_address")
         where = f"{situs_field} LIKE '%{needle}%'"
 
+        caveats = _Caveats()
+        caveats.add("limit_clamped", clamp_note)
+        query = {
+            "address": address,
+            "where": where,
+            "out_fields": self._summary_fields,
+            "limit": limit,
+        }
+
         records, _ = await self._query_property_layer(
             where, self._summary_fields, limit
         )
         if records:
-            return self._format_records(
+            text = self._format_records(
                 records,
                 limit,
                 where=where,
@@ -1098,7 +1445,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"## Parcels matching address `{address}` "
                     f"(matched directly on {situs_field})\n"
                 ),
-                notices=[clamp_note] if clamp_note else None,
+                caveats=caveats,
+            )
+            return _ToolOutput(
+                text,
+                self._envelope(
+                    query,
+                    {
+                        "returned_count": len(records),
+                        "match_method": "situs",
+                        "matched_address_point": None,
+                        "address_point": None,
+                    },
+                    caveats,
+                    rows=records,
+                ),
             )
 
         # Fallback: resolve via the address-point layer, then
@@ -1118,13 +1479,28 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         addr_feats = addr_data.get("features") or []
         if not addr_feats:
-            return (
+            caveats.add(
+                "no_address_match",
                 f"No parcel has a situs address matching `{address}`, and "
                 f"the address-point layer has no match either.\n"
                 f"Hints: use the abbreviated street type ('AVE', 'ST', "
                 f"'DR'); drop unit/apartment numbers; addresses are "
                 f"stored UPPERCASE (handled automatically); try just the "
-                f"house number + street name (e.g. '144 W 15TH')."
+                f"house number + street name (e.g. '144 W 15TH').",
+            )
+            return _ToolOutput(
+                "\n".join(caveats.messages),
+                self._envelope(
+                    query,
+                    {
+                        "returned_count": 0,
+                        "match_method": "none",
+                        "matched_address_point": None,
+                        "address_point": None,
+                    },
+                    caveats,
+                    rows=[],
+                ),
             )
 
         point = addr_feats[0].get("geometry") or {}
@@ -1136,13 +1512,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "retry, or use parcels_at_point with known coordinates."
             )
         pip_records = await self._parcels_intersecting_point(lat, lon)
-        lines = [
-            f"## Parcels at address `{address}`",
+        caveats.add(
+            "address_point_fallback",
             f"No direct {situs_field} match; resolved via the "
             f"address-point layer (matched `{matched_addr}`, point "
             f"lon={lon:.6f} lat={lat:.6f}) -> point-in-polygon on the "
             f"property layer.",
-        ]
+        )
+        summary = {
+            "returned_count": len(pip_records),
+            "match_method": "address_point",
+            "matched_address_point": matched_addr,
+            "address_point": {"lon": lon, "lat": lat},
+        }
+        lines = [f"## Parcels at address `{address}`"]
+        self._render_caveats(lines, caveats)
         if len(addr_feats) > 1:
             others = [
                 (f.get("attributes") or {}).get(addr_field) for f in addr_feats[1:]
@@ -1153,19 +1537,29 @@ class AnchorageParcelsPlugin(MCPPlugin):
             )
         lines.append("")
         if not pip_records:
-            lines.append(
+            outside = (
                 "The address point falls inside no property polygon -- "
                 "it may sit on a right-of-way or unassessed land."
             )
-            return "\n".join(lines)
+            caveats.add("point_outside_parcels", outside)
+            lines.append(outside)
+            return _ToolOutput(
+                "\n".join(lines),
+                self._envelope(query, summary, caveats, rows=[]),
+            )
         body = self._format_records(
             pip_records,
             limit,
             out_fields=self._summary_fields,
             heading=None,
-            notices=[clamp_note] if clamp_note else None,
+            # Caveats are already rendered above; pass a fresh list so
+            # the shared formatter does not repeat them.
+            caveats=_Caveats(),
         )
-        return "\n".join(lines) + "\n" + body
+        return _ToolOutput(
+            "\n".join(lines) + "\n" + body,
+            self._envelope(query, summary, caveats, rows=pip_records),
+        )
 
     # ── Tool: parcels_at_point ────────────────────────────────────────
 
@@ -1184,12 +1578,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "inSR": "4326",
                 "spatialRel": "esriSpatialRelIntersects",
                 "returnGeometry": "false",
-                "resultRecordCount": "20",
+                "resultRecordCount": str(self.POINT_QUERY_LIMIT),
             },
         )
         return [f.get("attributes") or {} for f in data.get("features") or []]
 
-    async def _parcels_at_point(self, args: Dict[str, Any]) -> str:
+    async def _parcels_at_point(self, args: Dict[str, Any]) -> _ToolOutput:
         try:
             lat = float(args["lat"])
             lon = float(args["lon"])
@@ -1205,19 +1599,36 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"Anchorage is roughly lat 61, lon -149."
             )
         records = await self._parcels_intersecting_point(lat, lon)
+        caveats = _Caveats()
+        query = {
+            "lat": lat,
+            "lon": lon,
+            "out_fields": self._summary_fields,
+            "limit": self.POINT_QUERY_LIMIT,
+        }
         lines = self._provenance(
             where=f"point intersect lon={lon}, lat={lat} (all categories)",
             out_fields=self._summary_fields,
-            limit=20,
+            limit=self.POINT_QUERY_LIMIT,
         )
         lines.append("")
         if not records:
-            lines.append(
+            caveats.add(
+                "point_outside_parcels",
                 f"No property polygons contain point (lat={lat}, "
                 f"lon={lon}). The point may be on a right-of-way, water, "
-                f"or outside the Municipality of Anchorage."
+                f"or outside the Municipality of Anchorage.",
             )
-            return "\n".join(lines)
+            self._render_caveats(lines, caveats)
+            return _ToolOutput(
+                "\n".join(lines),
+                self._envelope(
+                    query,
+                    {"returned_count": 0, "by_category": {}},
+                    caveats,
+                    rows=[],
+                ),
+            )
         cat_field = self._f("category")
         counts: Dict[str, int] = {}
         for r in records:
@@ -1225,22 +1636,32 @@ class AnchorageParcelsPlugin(MCPPlugin):
         lines.append(
             f"## {len(records)} record(s) contain point (lat={lat}, lon={lon})"
         )
-        lines.append(
+        caveats.add(
+            "stacked_categories",
             "Parcel, Lease, and Economic polygons can STACK at one "
             "point -- each hit is labeled with its category. By category: "
-            + ", ".join(f"{k}={n}" for k, n in sorted(counts.items()))
+            + ", ".join(f"{k}={n}" for k, n in sorted(counts.items())),
         )
+        self._render_caveats(lines, caveats)
         lines.append("")
         for i, r in enumerate(records, 1):
             lines.append(f"Record {i} [{r.get(cat_field)}]:")
             for key, value in r.items():
                 lines.append(f"  {key}: {self._render_value(key, value)}")
             lines.append("")
-        return "\n".join(lines)
+        return _ToolOutput(
+            "\n".join(lines),
+            self._envelope(
+                query,
+                {"returned_count": len(records), "by_category": counts},
+                caveats,
+                rows=records,
+            ),
+        )
 
     # ── Tool: query_parcels ───────────────────────────────────────────
 
-    async def _query_parcels(self, args: Dict[str, Any]) -> str:
+    async def _query_parcels(self, args: Dict[str, Any]) -> _ToolOutput:
         raw_where = str(args.get("where") or "").strip()
         if not raw_where:
             raise ValueError("where is required (use '1=1' to match everything)")
@@ -1265,29 +1686,64 @@ class AnchorageParcelsPlugin(MCPPlugin):
         (records, exceeded), total = await asyncio.gather(
             records_task, self._fetch_count(full_where)
         )
+        caveats = _Caveats()
+        caveats.add("limit_clamped", clamp_note)
+
+        remaining = None
+        if total is not None:
+            remaining = total - (offset + len(records))
+        has_more = (remaining is not None and remaining > 0) or (
+            remaining is None and exceeded
+        )
+        next_offset = offset + len(records) if has_more else None
+        if has_more:
+            caveats.add(
+                "more_pages_available",
+                f"**MORE PAGES AVAILABLE:** call query_parcels again "
+                f"with offset={next_offset} (same where/order_by) for the "
+                f"next page.",
+            )
+        if not records:
+            caveats.add(
+                "no_results",
+                "No records matched the WHERE clause.",
+            )
+
         text = self._format_records(
             records,
             limit,
             total_count=total,
             where=full_where,
             out_fields=out_fields,
-            notices=[clamp_note] if clamp_note else None,
+            caveats=caveats,
         )
-        remaining = None
-        if total is not None:
-            remaining = total - (offset + len(records))
-        if (remaining is not None and remaining > 0) or (
-            remaining is None and exceeded
-        ):
-            next_offset = offset + len(records)
-            text += (
-                f"\n**MORE PAGES AVAILABLE:** call query_parcels again "
-                f"with offset={next_offset} (same where/order_by) for the "
-                f"next page."
-            )
         if not records:
             text += self._no_data_hint(full_where)
-        return text
+        return _ToolOutput(
+            text,
+            self._envelope(
+                {
+                    "where": full_where,
+                    "requested_where": raw_where,
+                    "category": args.get("category"),
+                    "out_fields": out_fields,
+                    "order_by": order_by or None,
+                    "limit": limit,
+                    "offset": offset,
+                },
+                {
+                    "returned_count": len(records),
+                    "total_count": total,
+                    "truncated": bool(
+                        total is not None and records and total > len(records)
+                    ),
+                    "next_offset": next_offset,
+                    "exceeded_transfer_limit": bool(exceeded),
+                },
+                caveats,
+                rows=records,
+            ),
+        )
 
     # ── Tool: parcel_stats ────────────────────────────────────────────
 
@@ -1302,7 +1758,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         "percentile_cont",
     )
 
-    async def _parcel_stats(self, args: Dict[str, Any]) -> str:
+    async def _parcel_stats(self, args: Dict[str, Any]) -> _ToolOutput:
         stat_type = str(args.get("stat_type") or "").strip().lower()
         if stat_type not in self.STAT_TYPES:
             raise ValueError(
@@ -1355,6 +1811,15 @@ class AnchorageParcelsPlugin(MCPPlugin):
         stat_label = stat_type
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
+        caveats = _Caveats()
+        query = {
+            "stat_type": stat_type,
+            "stat_field": stat_field,
+            "group_by": group_by or None,
+            "percentile": percentile,
+            "where": full_where,
+            "category": args.get("category"),
+        }
         lines = self._provenance(where=full_where)
         lines += [
             "",
@@ -1363,8 +1828,24 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "",
         ]
         if not rows:
-            lines.append("No statistics returned (0 matching records).")
-            return "\n".join(lines) + self._no_data_hint(full_where)
+            # Zero-result branch: still emits conforming structured
+            # content rather than short-circuiting past the envelope.
+            caveats.add("no_results", "No statistics returned (0 matching records).")
+            self._render_caveats(lines, caveats)
+            return _ToolOutput(
+                "\n".join(lines) + self._no_data_hint(full_where),
+                self._envelope(query, {"group_count": 0}, caveats, rows=[]),
+            )
+        # Structured rows carry the RAW statistic value; the prose below
+        # applies thousands separators and float->int tidying, which
+        # would be lossy for a caller doing arithmetic.
+        structured_rows = [
+            {
+                "group": row.get(group_by) if group_by else None,
+                "value": row.get(out_name),
+            }
+            for row in rows
+        ]
         for row in rows:
             value = row.get(out_name)
             if isinstance(value, float) and value == int(value):
@@ -1379,7 +1860,15 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "",
                 f"({len(rows)} group(s); groups are ordered by {group_by}.)",
             ]
-        return "\n".join(lines)
+        return _ToolOutput(
+            "\n".join(lines),
+            self._envelope(
+                query,
+                {"group_count": len(structured_rows)},
+                caveats,
+                rows=structured_rows,
+            ),
+        )
 
     # ── Tool definitions ──────────────────────────────────────────────
 
@@ -1415,9 +1904,233 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "(multi-parcel economic units), or 'All'."
             ),
         }
+        rows_payload = {
+            "rows": {
+                "type": "array",
+                "description": "Matching records, RAW layer attributes.",
+                "items": _ROW_SCHEMA,
+            }
+        }
+
+        find_parcel_output = _envelope_schema(
+            "Parcels matching a parcel number -- or FUZZY candidates when "
+            "nothing matched exactly (check summary.exact_match).",
+            {
+                "parcel_id": {"type": "string"},
+                "category": {"type": ["string", "null"]},
+                "out_fields": {"type": "string"},
+                "limit": {"type": "integer"},
+                "where": {"type": "string"},
+                "variants_tried": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Every parcel-number format tried.",
+                },
+            },
+            {
+                "returned_count": {"type": "integer"},
+                "exact_match": {
+                    "type": "boolean",
+                    "description": (
+                        "False when `rows` are fuzzy LIKE candidates "
+                        "rather than exact hits -- verify before using."
+                    ),
+                },
+            },
+            rows_payload,
+        )
+
+        details_output = _envelope_schema(
+            "One parcel's full assessment record, or the candidate list "
+            "when the ID is ambiguous (condo units share parcel roots).",
+            {
+                "parcel_id": {"type": "string"},
+                "where": {"type": "string"},
+                "variants_tried": {"type": "array", "items": {"type": "string"}},
+            },
+            {
+                "match_count": {"type": "integer"},
+                "match_count_is_lower_bound": {
+                    "type": "boolean",
+                    "description": (
+                        "True when the true total is unknown and "
+                        "match_count is only the number listed."
+                    ),
+                },
+                "resolved": {
+                    "type": "boolean",
+                    "description": "True only when `result` is populated.",
+                },
+            },
+            {
+                "result": {
+                    "type": ["object", "null"],
+                    "description": (
+                        "The full RAW assessment record -- every field the "
+                        "layer returned, not the subset the prose renders. "
+                        "Null when the ID matched nothing or was ambiguous."
+                    ),
+                    "additionalProperties": True,
+                },
+                "candidates": {
+                    "type": "array",
+                    "items": _ROW_SCHEMA,
+                    "description": (
+                        "Records sharing this parcel root when the ID is "
+                        "ambiguous; empty on every other path."
+                    ),
+                },
+            },
+        )
+
+        owner_output = _envelope_schema(
+            "Parcels whose owner name matches, highest appraised value first.",
+            {
+                "name": {"type": "string"},
+                "category": {"type": ["string", "null"]},
+                "where": {"type": "string"},
+                "out_fields": {"type": "string"},
+                "order_by": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            {
+                "returned_count": {"type": "integer"},
+                "total_count": _NULLABLE_COUNT,
+                "truncated": {"type": "boolean"},
+            },
+            rows_payload,
+        )
+
+        address_output = _envelope_schema(
+            "Parcels at an address, matched on situs or via the "
+            "address-point layer (check summary.match_method).",
+            {
+                "address": {"type": "string"},
+                "where": {"type": "string"},
+                "out_fields": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            {
+                "returned_count": {"type": "integer"},
+                "match_method": {
+                    "type": "string",
+                    "enum": ["situs", "address_point", "none"],
+                    "description": (
+                        "'situs' = direct match on the parcel's own "
+                        "address; 'address_point' = resolved through the "
+                        "address layer then point-in-polygon, so the "
+                        "result is inferred; 'none' = no match at all."
+                    ),
+                },
+                "matched_address_point": {"type": ["string", "null"]},
+                "address_point": {
+                    "type": ["object", "null"],
+                    "properties": {
+                        "lon": {"type": "number"},
+                        "lat": {"type": "number"},
+                    },
+                    "additionalProperties": True,
+                },
+            },
+            rows_payload,
+        )
+
+        point_output = _envelope_schema(
+            "Every property polygon containing a coordinate. Parcel, "
+            "Lease and Economic polygons STACK, so one point can return "
+            "several records for the same ground.",
+            {
+                "lat": {"type": "number"},
+                "lon": {"type": "number"},
+                "out_fields": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            {
+                "returned_count": {"type": "integer"},
+                "by_category": {
+                    "type": "object",
+                    "description": "Record count per GIS_Category.",
+                    "additionalProperties": {"type": "integer"},
+                },
+            },
+            rows_payload,
+        )
+
+        query_output = _envelope_schema(
+            "Records matching an arbitrary WHERE clause, with the total "
+            "match count and paging state.",
+            {
+                "where": {"type": "string"},
+                "requested_where": {"type": "string"},
+                "category": {"type": ["string", "null"]},
+                "out_fields": {"type": "string"},
+                "order_by": {"type": ["string", "null"]},
+                "limit": {"type": "integer"},
+                "offset": {"type": "integer"},
+            },
+            {
+                "returned_count": {"type": "integer"},
+                "total_count": _NULLABLE_COUNT,
+                "truncated": {"type": "boolean"},
+                "next_offset": {
+                    "type": ["integer", "null"],
+                    "description": "Null when there is no further page.",
+                },
+                "exceeded_transfer_limit": {"type": "boolean"},
+            },
+            rows_payload,
+        )
+
+        stats_output = _envelope_schema(
+            "One statistic over the matching parcels, optionally grouped.",
+            {
+                "stat_type": {"type": "string"},
+                "stat_field": {"type": "string"},
+                "group_by": {"type": ["string", "null"]},
+                "percentile": {"type": ["number", "null"]},
+                "where": {"type": "string"},
+                "category": {"type": ["string", "null"]},
+            },
+            {"group_count": {"type": "integer"}},
+            {
+                "rows": {
+                    "type": "array",
+                    "description": "One entry per group (one entry total when ungrouped).",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "group": {
+                                "type": ["string", "number", "boolean", "null"],
+                                "description": (
+                                    "The group_by value, null when "
+                                    "ungrouped. Its type follows the "
+                                    "grouped field -- grouping on a "
+                                    "numeric field yields numbers."
+                                ),
+                            },
+                            "value": {
+                                "type": ["number", "string", "boolean", "null"],
+                                "description": (
+                                    "RAW statistic value, unformatted. A "
+                                    "STRING for min/max over a text field, "
+                                    "and null when the statistic is "
+                                    "undefined for the group (e.g. avg "
+                                    "over no non-null values) -- which is "
+                                    "NOT the same as zero."
+                                ),
+                            },
+                        },
+                        "required": ["group", "value"],
+                        "additionalProperties": True,
+                    },
+                }
+            },
+        )
+
         return [
             ToolDefinition(
                 name="find_parcel",
+                output_schema=find_parcel_output,
                 title="Find Parcel by Number",
                 description=(
                     f"Look up {city} parcels by parcel number in ANY of "
@@ -1458,6 +2171,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="get_parcel_details",
+                output_schema=details_output,
                 title="Parcel Detail Report",
                 description=(
                     f"Full assessment record for one {city} parcel: "
@@ -1487,6 +2201,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="search_by_owner",
+                output_schema=owner_output,
                 title="Search Parcels by Owner",
                 description=(
                     f"Find {city} parcels by owner name (substring "
@@ -1519,6 +2234,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="search_by_address",
+                output_schema=address_output,
                 title="Search Parcels by Address",
                 description=(
                     f"Find {city} parcels by street address. Tries the "
@@ -1553,6 +2269,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="parcels_at_point",
+                output_schema=point_output,
                 title="Parcels at Coordinates",
                 description=(
                     f"Find every {city} property record whose polygon "
@@ -1583,6 +2300,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="query_parcels",
+                output_schema=query_output,
                 title="Query Parcels",
                 description=(
                     f"Escape hatch: run a SQL WHERE clause against the "
@@ -1632,6 +2350,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ),
             ToolDefinition(
                 name="parcel_stats",
+                output_schema=stats_output,
                 title="Parcel Statistics",
                 description=(
                     f"Aggregate statistics over {city} property records: "
@@ -1713,9 +2432,15 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 error_message=f"Unknown tool: {tool_name}",
             )
         try:
-            text = await handler(arguments)
+            output = await handler(arguments)
             return ToolResult(
-                content=[{"type": "text", "text": self._with_retrieved_footer(text)}],
+                content=[
+                    {
+                        "type": "text",
+                        "text": self._with_retrieved_footer(output.text),
+                    }
+                ],
+                structured_content=output.structured,
                 success=True,
             )
         except Exception as e:

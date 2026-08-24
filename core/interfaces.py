@@ -38,6 +38,17 @@ class ToolDefinition(BaseModel):
     input_schema: Dict[str, Any] = Field(
         ..., description="JSON Schema for tool input parameters"
     )
+    output_schema: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Optional JSON Schema for the tool's structuredContent. "
+            "A declared schema is BINDING: the spec says servers MUST "
+            "return conforming results and clients SHOULD validate them. "
+            "Declare one only if EVERY return path of the tool emits "
+            "conforming structured content -- including the empty, "
+            "truncated and not-found branches."
+        ),
+    )
     annotations: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
@@ -56,6 +67,13 @@ class ToolResult(BaseModel):
         default_factory=list, description="Tool output content"
     )
     success: bool = Field(..., description="Whether the tool execution succeeded")
+    structured_content: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Machine-readable result, surfaced as `structuredContent`. "
+            "Must conform to the tool's declared output_schema."
+        ),
+    )
     error_message: Optional[str] = Field(
         None, description="Error message if execution failed"
     )

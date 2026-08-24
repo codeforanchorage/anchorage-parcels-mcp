@@ -13,6 +13,7 @@ import logging
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from jsonschema import Draft202012Validator
 from pydantic import ValidationError
 
 from core.interfaces import PluginType
@@ -23,6 +24,7 @@ from plugins.anchorage_parcels.config_schema import (
     AnchorageParcelsPluginConfig,
 )
 from plugins.anchorage_parcels.plugin import (
+    CAVEAT_CODES,
     DEFAULT_FIELD_MAP,
     AnchorageParcelsPlugin,
     _normalize_parcel_variants,
@@ -1180,6 +1182,504 @@ class TestParcelStats:
 
 
 # ── Error handling & plumbing ──────────────────────────────────────────
+
+
+# ── Structured output (outputSchema is a binding contract) ─────────────
+
+
+def declared_schema(plugin, tool_name):
+    for t in plugin.get_tools():
+        if t.name == tool_name:
+            assert t.output_schema, f"{tool_name} declares no output_schema"
+            return t.output_schema
+    raise AssertionError(f"no such tool: {tool_name}")
+
+
+def assert_conforms(plugin, tool_name, result):
+    """Validate a real tool result against the schema the server itself
+    advertises, and check the two output forms agree.
+
+    A declared outputSchema is BINDING: the spec says servers MUST return
+    conforming structured results and clients SHOULD validate them.
+    """
+    assert result.success, result.error_message
+    structured = result.structured_content
+    assert structured is not None, (
+        f"{tool_name} declares an outputSchema but returned no "
+        f"structuredContent on this path"
+    )
+    Draft202012Validator(declared_schema(plugin, tool_name)).validate(structured)
+
+    # Prose and structure are generated from ONE caveat list, so every
+    # structured message must be visible in the text a model reads.
+    text = result.content[0]["text"]
+    for caveat in structured["caveats"]:
+        assert caveat["code"] in CAVEAT_CODES, caveat
+        assert caveat["message"] in text, (
+            f"{tool_name}: caveat {caveat['code']} is in structuredContent "
+            f"but not in the rendered text"
+        )
+    return structured
+
+
+class TestOutputSchemaDeclarations:
+    def test_every_tool_declares_a_valid_output_schema(self, plugin):
+        for t in plugin.get_tools():
+            assert t.output_schema, f"{t.name} has no output_schema"
+            Draft202012Validator.check_schema(t.output_schema)
+
+    def test_output_schema_is_advertised_on_the_wire(self, plugin):
+        manager = PluginManager({})
+        manager.plugins = {"anchorage_parcels": plugin}
+        for tool in manager.get_all_tools():
+            assert "outputSchema" in tool, tool["name"]
+
+    def test_every_schema_uses_the_shared_envelope(self, plugin):
+        """One shape across the server, so a model learns it once."""
+        for t in plugin.get_tools():
+            required = set(t.output_schema["required"])
+            assert {"query", "summary", "caveats"} <= required, t.name
+            assert "rows" in required or "result" in required, t.name
+
+    def test_caveat_enum_matches_the_code_constant(self, plugin):
+        """The schema's enum and the code list are the same single source;
+        an emitted code outside the enum would violate our own contract."""
+        for t in plugin.get_tools():
+            enum = t.output_schema["properties"]["caveats"]["items"]["properties"][
+                "code"
+            ]["enum"]
+            assert enum == list(CAVEAT_CODES), t.name
+
+
+class TestStructuredOutputConformance:
+    """Every code path of a schema-declaring tool must emit conforming
+    structured content -- especially the awkward ones."""
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_exact_match(self, plugin):
+        install_client(
+            plugin, routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})]
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["summary"]["exact_match"] is True
+        assert structured["summary"]["returned_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_fuzzy_fallback(self, plugin):
+        """Zero exact hits: rows are LIKE candidates, not matches."""
+        install_client(
+            plugin,
+            routes=[
+                (
+                    lambda u, p: "LIKE" in p.get("where", ""),
+                    {"features": [feat(**SAMPLE_RECORD)]},
+                ),
+            ],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["summary"]["exact_match"] is False
+        assert any(c["code"] == "fuzzy_match" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_no_match_at_all(self, plugin):
+        install_client(plugin, default={"features": []})
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "999-999-99"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["rows"] == []
+        assert structured["summary"]["returned_count"] == 0
+        assert any(c["code"] == "no_fuzzy_candidates" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_limit_clamped(self, plugin):
+        install_client(
+            plugin, routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})]
+        )
+        result = await run_tool(
+            plugin, "find_parcel", {"parcel_id": "002-151-32", "limit": 5000}
+        )
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert any(c["code"] == "limit_clamped" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_get_parcel_details_found(self, plugin):
+        install_client(
+            plugin, routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})]
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "00215132000"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is True
+        assert structured["candidates"] == []
+        # The RAW record, not the subset the prose renders.
+        assert structured["result"]["Parcel_ID"] == "00215132000"
+
+    @pytest.mark.asyncio
+    async def test_get_parcel_details_not_found_still_emits_structure(self, plugin):
+        """The zero-result branch must NOT short-circuit past the envelope
+        -- a schema-declaring tool that returns nothing here is the exact
+        bug this contract is meant to catch."""
+        install_client(plugin, default={"features": []})
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "999-999-99"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["result"] is None
+        assert structured["candidates"] == []
+        assert structured["summary"]["resolved"] is False
+        assert structured["summary"]["match_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_parcel_details_ambiguous_condo(self, plugin):
+        units = [
+            feat(
+                Parcel_ID=f"0121820400{i}",
+                GIS_Category="Parcel",
+                Condo_Unit_Number=str(i),
+                Parcel_Address="HUNTSMEN CIR",
+                Owner_Name=f"OWNER {i}",
+            )
+            for i in range(1, 25)
+        ]
+        install_client(
+            plugin,
+            routes=[(is_count, {"count": 24}), (is_feature_query, {"features": units})],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "012-182-04"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["result"] is None
+        assert structured["summary"]["match_count"] == 24
+        assert structured["summary"]["match_count_is_lower_bound"] is False
+        assert len(structured["candidates"]) == 24
+        assert any(c["code"] == "multiple_records" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_get_parcel_details_ambiguous_count_unavailable(self, plugin):
+        """Count endpoint fails -> match_count is a LOWER BOUND, not a
+        string smuggled into an integer field."""
+        units = [
+            feat(Parcel_ID=f"0121820400{i}", GIS_Category="Parcel") for i in range(1, 4)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"error": {"message": "boom"}}),
+                (is_feature_query, {"features": units, "exceededTransferLimit": True}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "012-182-04"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert isinstance(structured["summary"]["match_count"], int)
+        assert structured["summary"]["match_count_is_lower_bound"] is True
+
+    @pytest.mark.asyncio
+    async def test_search_by_owner_with_and_without_total(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 500}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(plugin, "search_by_owner", {"name": "municipality"})
+        structured = assert_conforms(plugin, "search_by_owner", result)
+        assert structured["summary"]["total_count"] == 500
+        assert structured["summary"]["truncated"] is True
+
+    @pytest.mark.asyncio
+    async def test_search_by_owner_null_total_count_is_not_zero(self, plugin):
+        """A failed count is null, which a caller must not read as 0."""
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"error": {"message": "boom"}}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(plugin, "search_by_owner", {"name": "municipality"})
+        structured = assert_conforms(plugin, "search_by_owner", result)
+        assert structured["summary"]["total_count"] is None
+        assert structured["summary"]["returned_count"] == 1
+
+    @pytest.mark.asyncio
+    async def test_search_by_owner_empty(self, plugin):
+        install_client(
+            plugin,
+            routes=[(is_count, {"count": 0})],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "search_by_owner", {"name": "nobody"})
+        structured = assert_conforms(plugin, "search_by_owner", result)
+        assert structured["rows"] == []
+        assert any(c["code"] == "no_results" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_search_by_address_situs_match(self, plugin):
+        install_client(
+            plugin, routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})]
+        )
+        result = await run_tool(plugin, "search_by_address", {"address": "144 W 15TH"})
+        structured = assert_conforms(plugin, "search_by_address", result)
+        assert structured["summary"]["match_method"] == "situs"
+        assert structured["summary"]["address_point"] is None
+
+    @pytest.mark.asyncio
+    async def test_search_by_address_no_match_anywhere(self, plugin):
+        install_client(plugin, default={"features": []})
+        result = await run_tool(plugin, "search_by_address", {"address": "NOWHERE"})
+        structured = assert_conforms(plugin, "search_by_address", result)
+        assert structured["summary"]["match_method"] == "none"
+        assert structured["rows"] == []
+        assert any(c["code"] == "no_address_match" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_search_by_address_point_fallback(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    lambda u, p: p.get("returnGeometry") == "true",
+                    {
+                        "features": [
+                            {
+                                "attributes": {"FULL_ADDRESS": "144 W 15TH AVE"},
+                                "geometry": {"x": -149.8944, "y": 61.2091},
+                            }
+                        ]
+                    },
+                ),
+                (
+                    lambda u, p: p.get("geometryType") == "esriGeometryPoint",
+                    {"features": [feat(**SAMPLE_RECORD)]},
+                ),
+            ],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "search_by_address", {"address": "144 W 15TH"})
+        structured = assert_conforms(plugin, "search_by_address", result)
+        assert structured["summary"]["match_method"] == "address_point"
+        assert structured["summary"]["address_point"]["lat"] == 61.2091
+        assert any(c["code"] == "address_point_fallback" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_parcels_at_point_stacked_and_empty(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    is_feature_query,
+                    {
+                        "features": [
+                            feat(Parcel_ID="1", GIS_Category="Parcel"),
+                            feat(Parcel_ID="2", GIS_Category="Lease"),
+                        ]
+                    },
+                )
+            ],
+        )
+        result = await run_tool(
+            plugin, "parcels_at_point", {"lat": 61.2091, "lon": -149.8944}
+        )
+        structured = assert_conforms(plugin, "parcels_at_point", result)
+        assert structured["summary"]["by_category"] == {"Parcel": 1, "Lease": 1}
+        assert any(c["code"] == "stacked_categories" for c in structured["caveats"])
+
+        install_client(plugin, default={"features": []})
+        empty = await run_tool(plugin, "parcels_at_point", {"lat": 61.2, "lon": -149.9})
+        structured = assert_conforms(plugin, "parcels_at_point", empty)
+        assert structured["rows"] == []
+        assert structured["summary"]["by_category"] == {}
+
+    @pytest.mark.asyncio
+    async def test_query_parcels_paging_state(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 500}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)] * 10}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "query_parcels", {"where": "1=1", "limit": 10, "offset": 0}
+        )
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert structured["summary"]["next_offset"] == 10
+        assert structured["summary"]["truncated"] is True
+        assert any(c["code"] == "more_pages_available" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_query_parcels_last_page_has_null_next_offset(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 2}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)] * 2}),
+            ],
+        )
+        result = await run_tool(plugin, "query_parcels", {"where": "1=1", "limit": 10})
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert structured["summary"]["next_offset"] is None
+
+    @pytest.mark.asyncio
+    async def test_query_parcels_empty(self, plugin):
+        install_client(
+            plugin, routes=[(is_count, {"count": 0})], default={"features": []}
+        )
+        result = await run_tool(
+            plugin, "query_parcels", {"where": "Zoning_District = 'NOPE'"}
+        )
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert structured["rows"] == []
+        assert structured["summary"]["total_count"] == 0
+        assert any(c["code"] == "no_results" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_grouped_raw_values(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    is_feature_query,
+                    {
+                        "features": [
+                            feat(GIS_Category="Parcel", count_Parcel_ID=98348),
+                            feat(GIS_Category="Lease", count_Parcel_ID=596),
+                        ]
+                    },
+                )
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "parcel_stats",
+            {
+                "stat_type": "count",
+                "stat_field": "Parcel_ID",
+                "group_by": "GIS_Category",
+                "category": "All",
+            },
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        # RAW values: the prose says "98,348", the structure says 98348.
+        assert structured["rows"][0] == {"group": "Parcel", "value": 98348}
+        assert structured["summary"]["group_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_ungrouped_has_null_group(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    is_feature_query,
+                    {"features": [feat(avg_Appraised_Total_Value=425000.5)]},
+                )
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "parcel_stats",
+            {"stat_type": "avg", "stat_field": "Appraised_Total_Value"},
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["rows"] == [{"group": None, "value": 425000.5}]
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_null_value_is_not_zero(self, plugin):
+        """avg over no non-null values comes back null, and null is NOT
+        zero -- a schema requiring a number here would be violated."""
+        install_client(
+            plugin,
+            routes=[
+                (is_feature_query, {"features": [feat(avg_Appraised_Total_Value=None)]})
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "parcel_stats",
+            {"stat_type": "avg", "stat_field": "Appraised_Total_Value"},
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["rows"] == [{"group": None, "value": None}]
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_string_value_from_text_field(self, plugin):
+        """min/max over a TEXT field returns a string, not a number."""
+        install_client(
+            plugin,
+            routes=[
+                (is_feature_query, {"features": [feat(max_Owner_Name="ZZZ HOLDINGS")]})
+            ],
+        )
+        result = await run_tool(
+            plugin, "parcel_stats", {"stat_type": "max", "stat_field": "Owner_Name"}
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["rows"] == [{"group": None, "value": "ZZZ HOLDINGS"}]
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_numeric_group_key(self, plugin):
+        """Grouping on a numeric field yields numeric group keys."""
+        install_client(
+            plugin,
+            routes=[
+                (
+                    is_feature_query,
+                    {"features": [feat(YearBuilt=1962, count_Parcel_ID=12)]},
+                )
+            ],
+        )
+        result = await run_tool(
+            plugin,
+            "parcel_stats",
+            {
+                "stat_type": "count",
+                "stat_field": "Parcel_ID",
+                "group_by": "YearBuilt",
+            },
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["rows"] == [{"group": 1962, "value": 12}]
+
+    @pytest.mark.asyncio
+    async def test_parcel_stats_empty(self, plugin):
+        install_client(plugin, default={"features": []})
+        result = await run_tool(
+            plugin,
+            "parcel_stats",
+            {"stat_type": "sum", "stat_field": "Appraised_Total_Value"},
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["rows"] == []
+        assert structured["summary"]["group_count"] == 0
+        assert any(c["code"] == "no_results" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_date_fields_decode_map_is_present(self, plugin):
+        """Structured rows keep RAW epoch-ms dates; the decode map names
+        which fields those are."""
+        install_client(
+            plugin,
+            routes=[
+                (
+                    is_feature_query,
+                    {"features": [feat(Parcel_ID="1", Deed_Date=1609459200000)]},
+                )
+            ],
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert "Deed_Date" in structured["summary"]["date_fields_epoch_ms"]
+        # Raw in the structure...
+        assert structured["rows"][0]["Deed_Date"] == 1609459200000
+        # ...ISO in the prose.
+        assert "2021-01-01" in result.content[0]["text"]
 
 
 class TestErrorHandling:
