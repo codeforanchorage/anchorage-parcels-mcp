@@ -2,11 +2,17 @@ lambda_name = "anchorage-parcels-mcp-prod"
 stage_name  = "prod"
 aws_region  = "us-west-2"
 config_file = "config.yaml"
-# 512 MB / 60 s: the parcels tools are attribute queries and server-side
+# NOTE: lambda_memory and lambda_timeout here are OVERRIDDEN by the aws:
+# block in config.yaml (see terraform/aws/main.tf locals) -- they are kept
+# in sync so this file is not misleading, but config.yaml is the file to
+# edit. lambda_name works the OPPOSITE way: this file wins.
+#
+# 512 MB / 28 s: the parcels tools are attribute queries and server-side
 # statistics against a single Feature Layer -- no polygon-cache or
 # point-in-polygon batch workloads like the GIS server's aggregate tools.
+# 28 s sits just under API Gateway's hard, non-adjustable 29 s ceiling.
 lambda_memory  = 512
-lambda_timeout = 60
+lambda_timeout = 28
 
 api_quota_limit = 3000
 api_rate_limit  = 5
