@@ -39,6 +39,12 @@ with open(SNAPSHOT_PATH, encoding="utf-8") as _fh:
 SNAPSHOT_FIELDS = {f["name"] for f in _SNAPSHOT["fields"]}
 
 
+# Injected by default into every count/list query: ~1,000 features on this
+# layer are geometry-only shells with no assessment join, and including them
+# inflated every count by ~1%. See _assessed_clause.
+ASSESSED = "Parcel_ID IS NOT NULL AND Parcel_ID <> ''"
+
+
 def make_response(payload, status=200):
     resp = Mock()
     resp.status_code = status
@@ -756,8 +762,9 @@ class TestParcelsAtPoint:
         assert params["geometryType"] == "esriGeometryPoint"
         assert params["inSR"] == "4326"
         assert params["spatialRel"] == "esriSpatialRelIntersects"
-        # ALL categories: no GIS_Category filter.
-        assert params["where"] == "1=1"
+        # ALL categories: no GIS_Category filter, but the unassessed
+        # shells are still excluded by default.
+        assert params["where"] == ASSESSED
         # Each hit labeled with its category; stacked categories counted.
         assert "Record 1 [Parcel]" in text
         assert "Record 2 [Lease]" in text
@@ -853,7 +860,9 @@ class TestQueryParcels:
         assert len(feature_calls) == 1
         where = feature_calls[0][1]["where"]
         # Category filter AND'd around the caller's clause.
-        assert where == "(Zoning_District='RO') AND (GIS_Category = 'Parcel')"
+        assert where == (
+            f"(Zoning_District='RO') AND (GIS_Category = 'Parcel') AND ({ASSESSED})"
+        )
         assert "MORE PAGES" not in text
 
     @pytest.mark.asyncio
@@ -1067,7 +1076,9 @@ class TestParcelStats:
         ]
         assert params["groupByFieldsForStatistics"] == "GIS_Category"
         assert params["orderByFields"] == "GIS_Category"
-        assert params["where"] == "1=1"
+        # category='All' drops the GIS_Category filter, but the
+        # unassessed shells stay excluded by default.
+        assert params["where"] == ASSESSED
         assert "- Parcel: 98,348" in text
         assert "- Lease: 596" in text
         assert "3 group(s)" in text
@@ -1140,9 +1151,8 @@ class TestParcelStats:
                 "where": "Zoning_District='RO'",
             },
         )
-        assert (
-            calls[0][1]["where"]
-            == "(Zoning_District='RO') AND (GIS_Category = 'Parcel')"
+        assert calls[0][1]["where"] == (
+            f"(Zoning_District='RO') AND (GIS_Category = 'Parcel') AND ({ASSESSED})"
         )
 
     @pytest.mark.asyncio
@@ -1682,6 +1692,117 @@ class TestStructuredOutputConformance:
         assert structured["rows"][0]["Deed_Date"] == 1609459200000
         # ...ISO in the prose.
         assert "2021-01-01" in result.content[0]["text"]
+
+
+class TestUnassessedFilter:
+    """~1,000 features are geometry-only shells with no assessment join.
+
+    They are indistinguishable from real parcels in a count, so every
+    "how many parcels" answer was inflated by ~1% (98,391 -> 97,368 for
+    GIS_Category='Parcel', measured against the live layer 2026-08-24).
+    Excluded by default; include_unassessed=True brings them back with a
+    visible warning.
+    """
+
+    POINT_ARGS = {"lat": 61.2091, "lon": -149.8944}
+
+    @staticmethod
+    def _wheres(calls):
+        return [p.get("where", "") for _, p in calls]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("search_by_owner", {"name": "municipality"}),
+            ("search_by_address", {"address": "144 W 15TH"}),
+            ("parcels_at_point", POINT_ARGS),
+            ("query_parcels", {"where": "1=1"}),
+            ("parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"}),
+        ],
+    )
+    async def test_shells_excluded_by_default(self, plugin, tool, args):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(plugin, tool, args)
+        assert result.success, result.error_message
+        assert calls, f"{tool} issued no query"
+        assert all(ASSESSED in w for w in self._wheres(calls)), (
+            f"{tool} did not filter out the unassessed shells: {self._wheres(calls)}"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool,args",
+        [
+            ("search_by_owner", {"name": "municipality"}),
+            ("search_by_address", {"address": "144 W 15TH"}),
+            ("parcels_at_point", POINT_ARGS),
+            ("query_parcels", {"where": "1=1"}),
+            ("parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"}),
+        ],
+    )
+    async def test_include_unassessed_drops_the_filter_and_warns(
+        self, plugin, tool, args
+    ):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(plugin, tool, dict(args, include_unassessed=True))
+        assert result.success, result.error_message
+        assert not any(ASSESSED in w for w in self._wheres(calls)), (
+            f"{tool} still filtered despite include_unassessed=True"
+        )
+        # The caller must be told the extra records carry no assessment data.
+        structured = assert_conforms(plugin, tool, result)
+        assert any(c["code"] == "unassessed_included" for c in structured["caveats"]), (
+            f"{tool} included the shells without warning"
+        )
+        assert structured["query"]["include_unassessed"] is True
+
+    @pytest.mark.asyncio
+    async def test_default_is_recorded_as_false_in_structured_output(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(plugin, "query_parcels", {"where": "1=1"})
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert structured["query"]["include_unassessed"] is False
+        assert not any(
+            c["code"] == "unassessed_included" for c in structured["caveats"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_is_untouched(self, plugin):
+        """A shell has a null parcel number, so it can never match an ID
+        lookup -- the filter would be a no-op and the parameter a lie."""
+        calls = install_client(
+            plugin, routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})]
+        )
+        await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        assert not any(ASSESSED in w for w in self._wheres(calls))
+
+    def test_parameter_and_description_agree(self, plugin):
+        """A tool that takes the flag must say so; one that doesn't, must not."""
+        for t in plugin.get_tools():
+            takes = "include_unassessed" in t.input_schema["properties"]
+            says = "include_unassessed=True" in t.description
+            assert takes == says, (
+                f"{t.name}: parameter={takes} but description mentions it={says}"
+            )
 
 
 class TestErrorClassificationDoesNotDrift:

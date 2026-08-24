@@ -169,6 +169,7 @@ CAVEAT_CODES = (
     "no_address_match",  # neither situs nor address-point matched
     "point_outside_parcels",  # the point falls in no property polygon
     "stacked_categories",  # Parcel/Lease/Economic polygons overlap here
+    "unassessed_included",  # geometry-only shell records were NOT filtered out
 )
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -503,6 +504,35 @@ class AnchorageParcelsPlugin(MCPPlugin):
     @staticmethod
     def _sql_quote(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
+
+    def _assessed_clause(self, include_unassessed: Any) -> Optional[str]:
+        """Exclude geometry-only shell records unless asked not to.
+
+        ~1,000 features on this layer carry geometry and a formatted
+        parcel number but NO assessment join: null Parcel_ID,
+        Legal_Description, Land_Use and Appraised_Total_Value. They are
+        indistinguishable from real parcels in a count, so every
+        "how many parcels" answer was inflated by ~1% (98,391 -> 97,368
+        for GIS_Category='Parcel'). Filtered out by default; pass
+        include_unassessed=True to get them back.
+        """
+        if include_unassessed:
+            return None
+        field = self._f("parcel_id")
+        return f"{field} IS NOT NULL AND {field} <> ''"
+
+    @staticmethod
+    def _unassessed_caveat(include_unassessed: Any) -> Optional[str]:
+        """Banner shown when the shell records are deliberately included."""
+        if not include_unassessed:
+            return None
+        return (
+            "**UNASSESSED RECORDS INCLUDED:** results contain "
+            "geometry-only records with no assessment data (null "
+            "parcel number, legal description, land use and valuation). "
+            "They inflate counts by ~1% and their assessment fields "
+            "will be empty. Omit include_unassessed to exclude them."
+        )
 
     def _category_clause(self, category: Optional[str]) -> Optional[str]:
         """Build the GIS_Category filter; None means no filter."""
@@ -1369,9 +1399,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=20, maximum=self.MAX_LIMIT)
         category_clause = self._category_clause(args.get("category"))
         owner_field = self._f("owner_name")
+        include_unassessed = bool(args.get("include_unassessed", False))
+        assessed_clause = self._assessed_clause(include_unassessed)
         needle = name.upper().replace("'", "''")
         where = self._combine_where(
-            f"UPPER({owner_field}) LIKE '%{needle}%'", category_clause
+            f"UPPER({owner_field}) LIKE '%{needle}%'",
+            category_clause,
+            assessed_clause,
         )
         order_by = f"{self._f('appraised_total')} DESC"
         records_task = self._query_property_layer(
@@ -1382,6 +1416,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
+        caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
         if not records:
             caveats.add(
                 "no_results",
@@ -1407,6 +1442,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 {
                     "name": name,
                     "category": args.get("category"),
+                    "include_unassessed": include_unassessed,
                     "where": where,
                     "out_fields": self._summary_fields,
                     "order_by": order_by,
@@ -1433,12 +1469,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=10, maximum=100)
         needle = address.upper().replace("'", "''")
         situs_field = self._f("situs_address")
-        where = f"{situs_field} LIKE '%{needle}%'"
+        include_unassessed = bool(args.get("include_unassessed", False))
+        assessed_clause = self._assessed_clause(include_unassessed)
+        where = self._combine_where(f"{situs_field} LIKE '%{needle}%'", assessed_clause)
 
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
+        caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
         query = {
             "address": address,
+            "include_unassessed": include_unassessed,
             "where": where,
             "out_fields": self._summary_fields,
             "limit": limit,
@@ -1523,7 +1563,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "Address point found but no usable geometry returned; "
                 "retry, or use parcels_at_point with known coordinates."
             )
-        pip_records = await self._parcels_intersecting_point(lat, lon)
+        pip_records = await self._parcels_intersecting_point(lat, lon, assessed_clause)
         caveats.add(
             "address_point_fallback",
             f"No direct {situs_field} match; resolved via the "
@@ -1576,14 +1616,17 @@ class AnchorageParcelsPlugin(MCPPlugin):
     # ── Tool: parcels_at_point ────────────────────────────────────────
 
     async def _parcels_intersecting_point(
-        self, lat: float, lon: float
+        self,
+        lat: float,
+        lon: float,
+        assessed_clause: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Point-in-polygon on the property layer, all categories."""
         data = await self._layer_query(
             f"{self.plugin_config.property_layer_url}/query",
             {
                 "f": "json",
-                "where": "1=1",
+                "where": self._combine_where(assessed_clause),
                 "outFields": self._summary_fields,
                 "geometry": f"{lon},{lat}",
                 "geometryType": "esriGeometryPoint",
@@ -1610,11 +1653,15 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"lat must be in [-90, 90] and lon in [-180, 180]; "
                 f"Anchorage is roughly lat 61, lon -149."
             )
-        records = await self._parcels_intersecting_point(lat, lon)
+        include_unassessed = bool(args.get("include_unassessed", False))
+        assessed_clause = self._assessed_clause(include_unassessed)
+        records = await self._parcels_intersecting_point(lat, lon, assessed_clause)
         caveats = _Caveats()
+        caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
         query = {
             "lat": lat,
             "lon": lon,
+            "include_unassessed": include_unassessed,
             "out_fields": self._summary_fields,
             "limit": self.POINT_QUERY_LIMIT,
         }
@@ -1692,7 +1739,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"offset must be an integer (got {raw_offset!r})."
             ) from None
         category_clause = self._category_clause(args.get("category"))
-        full_where = self._combine_where(where, category_clause)
+        include_unassessed = bool(args.get("include_unassessed", False))
+        full_where = self._combine_where(
+            where, category_clause, self._assessed_clause(include_unassessed)
+        )
 
         records_task = self._query_property_layer(
             full_where,
@@ -1706,6 +1756,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
+        caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
 
         remaining = None
         if total is not None:
@@ -1744,6 +1795,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     "where": full_where,
                     "requested_where": raw_where,
                     "category": args.get("category"),
+                    "include_unassessed": include_unassessed,
                     "out_fields": out_fields,
                     "order_by": order_by or None,
                     "limit": limit,
@@ -1794,7 +1846,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
         where = WhereValidator.validate(raw_where or "1=1")
         WhereValidator.validate_against_schema(where, self._live_fields)
         category_clause = self._category_clause(args.get("category"))
-        full_where = self._combine_where(where, category_clause)
+        include_unassessed = bool(args.get("include_unassessed", False))
+        full_where = self._combine_where(
+            where, category_clause, self._assessed_clause(include_unassessed)
+        )
 
         out_name = f"{stat_type}_{stat_field}"
         stat_entry: Dict[str, Any] = {
@@ -1837,8 +1892,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
         caveats = _Caveats()
+        caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
         query = {
             "stat_type": stat_type,
+            "include_unassessed": include_unassessed,
             "stat_field": stat_field,
             "group_by": group_by or None,
             "percentile": percentile,
@@ -1861,6 +1918,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "\n".join(lines) + self._no_data_hint(full_where),
                 self._envelope(query, {"group_count": 0}, caveats, rows=[]),
             )
+        # Render caveats on the SUCCESS path too. The zero-result branch
+        # above already does; without this, a caveat could exist in
+        # structuredContent and be invisible in the text.
+        self._render_caveats(lines, caveats)
+        if len(caveats):
+            lines.append("")
+
         # Structured rows carry the RAW statistic value; the prose below
         # applies thousands separators and float->int tidying, which
         # would be lossy for a caller doing arithmetic.
@@ -1919,6 +1983,22 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "other MOA layers (zoning polygons, trails, flood zones, "
             "spatial analysis), use the Anchorage GIS MCP server."
         )
+        unassessed_note = (
+            "Excludes ~1,000 geometry-only records with no assessment "
+            "data; pass include_unassessed=True to include them."
+        )
+        include_unassessed_schema = {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Include geometry-only records that carry NO assessment "
+                "data (null parcel number, legal description, land use "
+                "and valuation). ~1,000 such shells exist and are "
+                "EXCLUDED by default because they inflate every count by "
+                "about 1%. Pass true only when you specifically want the "
+                "unjoined geometry."
+            ),
+        }
         category_schema = {
             "type": "string",
             "enum": list(CATEGORY_VALUES) + ["All"],
@@ -2234,7 +2314,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"value (highest first). Results are public-record "
                     f"assessment data published by the Municipality. "
                     f"Example: search_by_owner(name='municipality of "
-                    f"anchorage') lists MOA-owned parcels. {summary_note}"
+                    f"anchorage') lists MOA-owned parcels. {summary_note} "
+                    f"{unassessed_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2252,6 +2333,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             "description": "Max records (1-1000)",
                         },
                         "category": category_schema,
+                        "include_unassessed": include_unassessed_schema,
                     },
                     "required": ["name"],
                 },
@@ -2269,7 +2351,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"property layer (the response says which path was "
                     f"used). Example: search_by_address(address='144 W "
                     f"15th Ave'). Use abbreviated street types (AVE, "
-                    f"ST, DR). {summary_note}"
+                    f"ST, DR). {summary_note} {unassessed_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2287,6 +2369,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             "default": 10,
                             "description": "Max records (1-100)",
                         },
+                        "include_unassessed": include_unassessed_schema,
                     },
                     "required": ["address"],
                 },
@@ -2302,7 +2385,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"Economic polygons can stack at one spot, and each "
                     f"hit is labeled with its category. Example: "
                     f"parcels_at_point(lat=61.2091, lon=-149.8944). "
-                    f"{CASE_SENSITIVE_NOTE} {routing_note}"
+                    f"{CASE_SENSITIVE_NOTE} {unassessed_note} {routing_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2318,6 +2401,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                                 "(negative in Anchorage, ~-149.9)"
                             ),
                         },
+                        "include_unassessed": include_unassessed_schema,
                     },
                     "required": ["lat", "lon"],
                 },
@@ -2334,7 +2418,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f'Appraised_Total_Value > 1000000", order_by='
                     f"'Appraised_Total_Value DESC'). Text values are "
                     f"stored UPPERCASE; {CASE_SENSITIVE_NOTE} "
-                    f"{summary_note} {routing_note}"
+                    f"{summary_note} {unassessed_note} {routing_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2354,6 +2438,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             ),
                         },
                         "category": category_schema,
+                        "include_unassessed": include_unassessed_schema,
                         "limit": {
                             "type": "integer",
                             "default": 100,
@@ -2386,7 +2471,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"parcel_stats(stat_type='percentile_cont', "
                     f"stat_field='Appraised_Total_Value', "
                     f"group_by='Zoning_District'). {CASE_SENSITIVE_NOTE} "
-                    f"{routing_note}"
+                    f"{unassessed_note} {routing_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2421,6 +2506,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             ),
                         },
                         "category": category_schema,
+                        "include_unassessed": include_unassessed_schema,
                         "percentile": {
                             "type": "number",
                             "default": 0.5,
