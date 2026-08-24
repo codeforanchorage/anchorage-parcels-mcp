@@ -212,6 +212,11 @@ lambda-deployment.zip
 terraform/*/.terraform/
 terraform/*/.terraform.lock.hcl
 terraform/*/lambda-deployment.zip
+# Saved plan files: binary, and they embed resolved infrastructure detail
+# (account id, ARNs, resource ids) plus any sensitive variable values.
+terraform/*/tfplan
+**/*.tfplan
+tfplan
 
 # Terraform state (contains secrets, ignore across all folders)
 **/*.tfstate
