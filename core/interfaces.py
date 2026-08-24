@@ -24,6 +24,16 @@ class ToolDefinition(BaseModel):
     """Definition of an MCP tool provided by a plugin."""
 
     name: str = Field(..., description="Tool name (without plugin prefix)")
+    title: Optional[str] = Field(
+        default=None,
+        description=(
+            "Short human-readable display name. This is a TOP-LEVEL field "
+            "on the MCP Tool type (via BaseMetadata), NOT an annotation. "
+            "Client display precedence is title -> annotations.title -> "
+            "name; the wire `name` is plugin-prefixed and reads badly in "
+            "a tool picker, so set this on every tool."
+        ),
+    )
     description: str = Field(..., description="Human-readable tool description")
     input_schema: Dict[str, Any] = Field(
         ..., description="JSON Schema for tool input parameters"
@@ -31,8 +41,10 @@ class ToolDefinition(BaseModel):
     annotations: Optional[Dict[str, Any]] = Field(
         default=None,
         description=(
-            "Optional MCP tool annotations (e.g. readOnlyHint, openWorldHint) "
-            "that hint at a tool's behavior to clients."
+            "Optional MCP tool annotations (e.g. readOnlyHint, "
+            "openWorldHint) that hint at a tool's behavior to clients. "
+            "Do NOT set idempotentHint on a read-only tool: the schema "
+            "documents it as meaningful only when readOnlyHint is false."
         ),
     )
 
