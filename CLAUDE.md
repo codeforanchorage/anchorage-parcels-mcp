@@ -147,7 +147,23 @@ the behaviour, change the test deliberately rather than deleting it.
 
 ## CI
 
-**There is currently no CI in this repository** — no `.github/` directory exists.
-Lint, tests and the conformance guards above run only when someone runs them
-locally. Adding a workflow (ruff lint/format, pip-audit, pytest, Go tests) is a
-known outstanding task; pushing one needs `workflow` scope on the token.
+`.github/workflows/ci.yml` runs on push to main/develop and on every PR:
+
+- **Lint & test (Python 3.11, the Lambda runtime)** — `ruff check`, `ruff format
+  --check`, a config-validation step that asserts the timeout ladder still holds
+  (plugin < lambda < API Gateway's hard 29s), then the full pytest suite with
+  coverage. This is what enforces the conformance invariants above.
+- **pip-audit** on `requirements.txt` — the runtime deps that ship in the zip.
+- **Go client** — `go vet` and `go test` in `client/`.
+
+Two things to know before editing it:
+
+- **Ruff is pinned to 0.15.1** to match `.pre-commit-config.yaml`. The formatter
+  is not stable across releases, so an unpinned CI install would disagree with
+  the hook developers run locally.
+- **The format step excludes eight files** whose drift predates the gate. That
+  is what lets the gate block NEW drift without a repo-wide reformat first. The
+  list should only ever shrink — delete an entry once its file is formatted, and
+  do not add to it.
+
+Coverage is reported, not enforced; no threshold is configured.

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+
+# A second push to the same branch cancels the first -- these jobs are
+# cheap but there is no point paying for a run nobody will read.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python:
+    name: Lint & test (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Lambda runtime. Testing on the version we deploy
+          # is worth more than testing on the newest available.
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+          pip install pytest-cov
+          # Pinned to match .pre-commit-config.yaml. Ruff's formatter is
+          # not stable across releases, so an unpinned install here would
+          # disagree with the hook developers run locally.
+          pip install ruff==0.15.1
+
+      - name: Ruff lint
+        run: ruff check core/ plugins/ server/ tests/
+
+      # These eight files carry formatting drift that predates the gate.
+      # Excluding them lets the gate block NEW drift today rather than
+      # waiting on a repo-wide reformat. The list should only ever shrink;
+      # delete an entry once its file is formatted.
+      - name: Ruff format
+        run: |
+          ruff format --check core/ plugins/ server/ tests/ \
+            --exclude plugins/anchorage_gis/config_schema.py \
+            --exclude plugins/anchorage_gis/plugin.py \
+            --exclude plugins/arcgis/where_validator.py \
+            --exclude server/adapters/aws_lambda.py \
+            --exclude server/http_handler.py \
+            --exclude tests/test_anchorage_gis_plugin.py \
+            --exclude tests/test_arcgis_plugin.py \
+            --exclude tests/test_http_handler.py
+
+      # config.yaml is gitignored, so CI validates the tracked source this
+      # fork actually deploys from.
+      - name: Validate config
+        run: |
+          python -c "
+          from core.validators import load_and_validate_config, get_enabled_plugin_config
+          config = load_and_validate_config('config-anchorage-parcels.yaml')
+          name, plugin = get_enabled_plugin_config(config)
+          lambda_timeout = config['aws']['lambda_timeout']
+          plugin_timeout = plugin['timeout']
+          print(f'plugin={name} plugin_timeout={plugin_timeout}s lambda={lambda_timeout}s')
+          # API Gateway enforces a hard, non-adjustable 29s integration
+          # timeout; the plugin's own HTTP timeout must sit under the
+          # Lambda's so a hung upstream returns a readable tool error
+          # instead of the Lambda being killed mid-flight.
+          assert lambda_timeout < 29, f'lambda_timeout {lambda_timeout} >= API Gateway 29s ceiling'
+          assert plugin_timeout < lambda_timeout, f'plugin timeout {plugin_timeout} >= lambda {lambda_timeout}'
+          "
+
+      # Runs the MCP conformance suite: binding outputSchema validation,
+      # caveat/prose parity, and the error-classification drift guards.
+      - name: Pytest
+        run: |
+          pytest tests/ -q \
+            --cov=core --cov=plugins --cov=server \
+            --cov-report=term-missing
+
+  audit:
+    name: pip-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install pip-audit
+      # Runtime dependencies only -- these are what ship in the Lambda zip.
+      - run: pip-audit -r requirements.txt
+
+  go:
+    name: Go client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.21"
+          # The client module declares no dependencies, so there is no
+          # go.sum to key a cache on; pointing at one fails the step.
+          cache: false
+      - name: Vet
+        working-directory: client
+        run: go vet ./...
+      - name: Test
+        working-directory: client
+        run: go test ./...
