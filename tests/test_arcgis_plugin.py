@@ -353,9 +353,7 @@ class TestWhereValidatorAgainstSchema:
         WhereValidator.validate_against_schema("FOO='x'", set())
 
     def test_valid_field_passes(self):
-        WhereValidator.validate_against_schema(
-            "STATUS='Active'", {"STATUS", "NAME"}
-        )
+        WhereValidator.validate_against_schema("STATUS='Active'", {"STATUS", "NAME"})
 
     def test_typo_field_raises_with_suggestion(self):
         with pytest.raises(ValueError, match="STATUUS"):
@@ -374,9 +372,7 @@ class TestWhereValidatorAgainstSchema:
 
     def test_unknown_field_no_close_match(self):
         with pytest.raises(ValueError, match="XYZQR"):
-            WhereValidator.validate_against_schema(
-                "XYZQR='foo'", {"STATUS", "NAME"}
-            )
+            WhereValidator.validate_against_schema("XYZQR='foo'", {"STATUS", "NAME"})
 
     def test_sql_keywords_not_treated_as_fields(self):
         # IS, NULL, AND, OR, IN, LIKE — all SQL keywords, not fields.
@@ -387,21 +383,15 @@ class TestWhereValidatorAgainstSchema:
     def test_case_sensitive_field_match(self):
         # ArcGIS field names are case-sensitive. STATUS != status.
         with pytest.raises(ValueError, match="status"):
-            WhereValidator.validate_against_schema(
-                "status='Active'", {"STATUS"}
-            )
+            WhereValidator.validate_against_schema("status='Active'", {"STATUS"})
 
     def test_string_values_not_treated_as_fields(self):
         # The literal 'Park' must not be flagged as an unknown field.
-        WhereValidator.validate_against_schema(
-            "NAME='Park'", {"NAME"}
-        )
+        WhereValidator.validate_against_schema("NAME='Park'", {"NAME"})
 
     def test_function_call_field_inside(self):
         # UPPER is a keyword; STATUS inside is the real field.
-        WhereValidator.validate_against_schema(
-            "UPPER(STATUS)='ACTIVE'", {"STATUS"}
-        )
+        WhereValidator.validate_against_schema("UPPER(STATUS)='ACTIVE'", {"STATUS"})
 
 
 # ── Config schema ──────────────────────────────────────────────────────

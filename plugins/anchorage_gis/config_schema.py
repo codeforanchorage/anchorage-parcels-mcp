@@ -25,9 +25,7 @@ class AnchorageGISPluginConfig(BaseModel):
     )
     org_id: str = Field(..., description="ArcGIS organization ID")
     city_name: str = Field(..., description="Name of the city/municipality")
-    gallery_url: str = Field(
-        ..., description="Public URL for the GIS gallery app"
-    )
+    gallery_url: str = Field(..., description="Public URL for the GIS gallery app")
     timeout: int = Field(
         default=30, ge=1, le=300, description="HTTP request timeout in seconds"
     )

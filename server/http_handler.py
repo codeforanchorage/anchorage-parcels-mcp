@@ -91,9 +91,7 @@ def _load_config() -> Dict[str, Any]:
             # checks) without a second config convention.
             if os.path.isfile(config_json):
                 _config = load_and_validate_config(config_json)
-                logger.info(
-                    "Loaded configuration from OPENCONTEXT_CONFIG file path"
-                )
+                logger.info("Loaded configuration from OPENCONTEXT_CONFIG file path")
                 return _config
             logger.error(f"Failed to parse config from environment: {e}")
             raise
@@ -195,9 +193,7 @@ class UniversalHTTPHandler:
         logger.info("UniversalHTTPHandler initialized")
 
     @classmethod
-    def _get_cors_headers(
-        cls, request_origin: Optional[str] = None
-    ) -> Dict[str, str]:
+    def _get_cors_headers(cls, request_origin: Optional[str] = None) -> Dict[str, str]:
         """Build CORS response headers, reflecting allowlisted origins.
 
         Args:
@@ -403,8 +399,7 @@ class UniversalHTTPHandler:
                 }
             )
             logger.warning(
-                f"400 error: unsupported MCP-Protocol-Version "
-                f"'{protocol_version}'",
+                f"400 error: unsupported MCP-Protocol-Version '{protocol_version}'",
                 extra={
                     "request_id": request_id,
                     "request_path": path,

@@ -34,9 +34,8 @@ python -m pytest tests/ --cov=core --cov=plugins --cov-report=term-missing
 python -m ruff check core/ plugins/ server/ tests/       # Check
 python -m ruff check core/ plugins/ server/ tests/ --fix # Auto-fix
 python -m ruff format core/ plugins/ server/ tests/      # Format
-# NOTE: several files carry pre-existing format drift under newer ruff than
-# the pinned pre-commit version. Do NOT run a wholesale `ruff format` --
-# format only the files you touched.
+# The tree is fully format-clean and CI enforces it, so a wholesale
+# `ruff format` is safe and produces no diff.
 
 # Smoke test a deployed endpoint (55 HTTP-level checks)
 python scripts/smoke_http.py [prod|staging|<url>]
@@ -161,9 +160,7 @@ Two things to know before editing it:
 - **Ruff is pinned to 0.15.1** to match `.pre-commit-config.yaml`. The formatter
   is not stable across releases, so an unpinned CI install would disagree with
   the hook developers run locally.
-- **The format step excludes eight files** whose drift predates the gate. That
-  is what lets the gate block NEW drift without a repo-wide reformat first. The
-  list should only ever shrink — delete an entry once its file is formatted, and
-  do not add to it.
+- **The format step covers everything; there are no exclusions.** Keep it that
+  way — an exclusion is a permanent hole in the gate rather than a to-do.
 
 Coverage is reported, not enforced; no threshold is configured.
