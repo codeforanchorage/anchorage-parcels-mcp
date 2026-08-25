@@ -107,8 +107,17 @@ def is_count(url, params):
     return params.get("returnCountOnly") == "true"
 
 
+def is_distinct_query(url, params):
+    """The lazy Zoning_District variant lookup, not a record fetch."""
+    return params.get("returnDistinctValues") == "true"
+
+
 def is_feature_query(url, params):
-    return url.endswith("/query") and "returnCountOnly" not in params
+    return (
+        url.endswith("/query")
+        and "returnCountOnly" not in params
+        and not is_distinct_query(url, params)
+    )
 
 
 @pytest.fixture
@@ -1151,7 +1160,8 @@ class TestParcelStats:
                 "where": "Zoning_District='RO'",
             },
         )
-        assert calls[0][1]["where"] == (
+        feature_calls = [c for c in calls if is_feature_query(*c)]
+        assert feature_calls[0][1]["where"] == (
             f"(Zoning_District='RO') AND (GIS_Category = 'Parcel') AND ({ASSESSED})"
         )
 
@@ -1692,6 +1702,229 @@ class TestStructuredOutputConformance:
         assert structured["rows"][0]["Deed_Date"] == 1609459200000
         # ...ISO in the prose.
         assert "2021-01-01" in result.content[0]["text"]
+
+
+class TestLimitedCoverageBanner:
+    """The GIS server warns that this same layer covers ~48% of the muni;
+    the parcels server, where aggregate questions are likelier, did not."""
+
+    @pytest.mark.asyncio
+    async def test_banner_fires_on_aggregate_tools(self, plugin):
+        plugin._coverage_pct = 0.4846  # what the live extent computes to
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        for tool, args in [
+            ("query_parcels", {"where": "1=1"}),
+            ("parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"}),
+        ]:
+            result = await run_tool(plugin, tool, args)
+            structured = assert_conforms(plugin, tool, result)
+            banner = [
+                c for c in structured["caveats"] if c["code"] == "limited_coverage"
+            ]
+            assert banner, f"{tool} did not warn about coverage"
+            # Wording must match the GIS server's verbatim.
+            assert (
+                "**LIMITED COVERAGE:** this layer's extent covers ~48%"
+                in (banner[0]["message"])
+            )
+
+    @pytest.mark.asyncio
+    async def test_silent_when_coverage_is_adequate_or_unknown(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        for pct in (None, 0.9):
+            plugin._coverage_pct = pct
+            result = await run_tool(plugin, "query_parcels", {"where": "1=1"})
+            structured = assert_conforms(plugin, "query_parcels", result)
+            assert not [
+                c for c in structured["caveats"] if c["code"] == "limited_coverage"
+            ], f"banner fired at coverage={pct}"
+
+    def test_reuses_the_gis_coverage_maths(self, plugin):
+        """Same layer, same figure -- not a second implementation."""
+        from plugins.anchorage_gis.plugin import AnchorageGISPlugin
+
+        extent = {
+            "xmin": -16729973.187121626,
+            "ymin": 8572850.312372128,
+            "xmax": -16564590.02643105,
+            "ymax": 8738290.529313235,
+            "spatialReference": {"wkid": 102100, "latestWkid": 3857},
+        }
+        plugin._capture_layer_meta({"extent": extent, "fields": []})
+        assert plugin._coverage_pct == AnchorageGISPlugin._anchorage_coverage_pct(
+            extent
+        )
+        assert round(plugin._coverage_pct * 100) == 48
+
+
+class TestOwnerMatchModes:
+    """Owner names are stored surname-first and UPPERCASE, so 'Babb'
+    substring-matches Babbitt, Babbie and Babbe."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "mode,expected",
+        [
+            ("contains", "UPPER(Owner_Name) LIKE '%BABB%'"),
+            ("starts_with", "UPPER(Owner_Name) LIKE 'BABB%'"),
+            (
+                "surname",
+                "(UPPER(Owner_Name) LIKE 'BABB %' OR UPPER(Owner_Name) = 'BABB')",
+            ),
+        ],
+    )
+    async def test_match_mode_shapes_the_clause(self, plugin, mode, expected):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "search_by_owner", {"name": "Babb", "match": mode}
+        )
+        where = [p for _, p in calls if is_feature_query("/query", p)][0]["where"]
+        assert expected in where
+        structured = assert_conforms(plugin, "search_by_owner", result)
+        assert structured["query"]["match"] == mode
+
+    @pytest.mark.asyncio
+    async def test_default_is_contains(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        await run_tool(plugin, "search_by_owner", {"name": "Babb"})
+        where = [p for _, p in calls if is_feature_query("/query", p)][0]["where"]
+        assert "LIKE '%BABB%'" in where
+
+    @pytest.mark.asyncio
+    async def test_unknown_mode_is_a_caller_error(self, plugin):
+        install_client(plugin)
+        result = await run_tool(
+            plugin, "search_by_owner", {"name": "Babb", "match": "fuzzy"}
+        )
+        assert result.success is False
+        assert "match must be one of" in result.error_message
+
+
+class TestZoningVariantExpansion:
+    """Zoning_District is not normalized: B2C (680 records) and B-2C (1)
+    are distinct stored values, likewise CER1A/CE-R1A and I2/I-2."""
+
+    DISTINCT = {
+        "features": [
+            {"attributes": {"Zoning_District": v}}
+            for v in ("B2C", "B-2C", "R1", "CER1A", "CE-R1A")
+        ]
+    }
+
+    @pytest.mark.asyncio
+    async def test_equality_filter_folds_in_the_hyphenated_twin(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_distinct_query, self.DISTINCT),
+                (is_count, {"count": 681}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "query_parcels", {"where": "Zoning_District = 'B2C'"}
+        )
+        where = [p for _, p in calls if is_feature_query("/query", p)][0]["where"]
+        assert "Zoning_District IN ('B-2C','B2C')" in where
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert any(
+            c["code"] == "zoning_variants_matched" for c in structured["caveats"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_twin_leaves_the_clause_alone(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_distinct_query, self.DISTINCT),
+                (is_count, {"count": 5}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "query_parcels", {"where": "Zoning_District = 'R1'"}
+        )
+        where = [p for _, p in calls if is_feature_query("/query", p)][0]["where"]
+        assert "Zoning_District = 'R1'" in where
+        structured = assert_conforms(plugin, "query_parcels", result)
+        assert not any(
+            c["code"] == "zoning_variants_matched" for c in structured["caveats"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_variant_lookup_is_cached(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_distinct_query, self.DISTINCT),
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        for _ in range(3):
+            await run_tool(
+                plugin, "query_parcels", {"where": "Zoning_District = 'B2C'"}
+            )
+        distinct_calls = [c for c in calls if is_distinct_query(*c)]
+        assert len(distinct_calls) == 1, (
+            "variant map should be fetched once per container"
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_lookup_when_the_query_ignores_zoning(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        await run_tool(plugin, "query_parcels", {"where": "Lot_Size > 5000"})
+        assert not [c for c in calls if is_distinct_query(*c)], (
+            "queries that never mention zoning must not pay for the lookup"
+        )
+
+    @pytest.mark.asyncio
+    async def test_lookup_failure_degrades_instead_of_breaking(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_distinct_query, {"error": {"code": 500, "message": "boom"}}),
+                (is_count, {"count": 1}),
+                (is_feature_query, {"features": [feat(**SAMPLE_RECORD)]}),
+            ],
+        )
+        plugin.ARCGIS_RETRY_BACKOFF_S = 0
+        result = await run_tool(
+            plugin, "query_parcels", {"where": "Zoning_District = 'B2C'"}
+        )
+        assert result.success, result.error_message
+        where = [p for _, p in calls if is_feature_query("/query", p)][0]["where"]
+        assert "Zoning_District = 'B2C'" in where
 
 
 class TestEmptyColumnRendering:

@@ -53,6 +53,12 @@ logger = logging.getLogger(__name__)
 # nothing about this plugin.
 _normalize_parcel_variants = AnchorageGISPlugin._normalize_parcel_variants
 
+# Layer-extent vs municipality-area coverage, shared with the GIS server so
+# the two report the same figure for the same layer (both wrap
+# PropertyInformation). Returns None when coverage cannot be computed
+# honestly, in which case the caveat stays silent.
+_anchorage_coverage_pct = AnchorageGISPlugin._anchorage_coverage_pct
+
 # Logical -> physical field-name map for the property layer (plus the
 # two supporting layers at the bottom). THIS IS THE ONE BLOCK a forker
 # edits (or overrides per-key via the `field_map` config option) to
@@ -172,6 +178,8 @@ CAVEAT_CODES = (
     "unassessed_included",  # geometry-only shell records were NOT filtered out
     "all_fields_null",  # every requested field is empty on every row
     "empty_columns_dropped",  # columns null across the whole page, omitted
+    "limited_coverage",  # layer extent covers well under the whole muni
+    "zoning_variants_matched",  # hyphenated/unhyphenated zoning twin folded in
 )
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -346,6 +354,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
     COMPACT_FORMAT_THRESHOLD = 20
     # Max stacked polygons returned for one point-in-polygon lookup.
     POINT_QUERY_LIMIT = 20
+    # Below this share of the municipality, warn that the layer does not
+    # cover the whole muni. Same threshold as the GIS server.
+    COVERAGE_THRESHOLD = AnchorageGISPlugin.COVERAGE_THRESHOLD
 
     SCHEMA_SNAPSHOT_PATH = Path(__file__).parent / "schema" / "propertyinformation.json"
 
@@ -358,6 +369,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # startup fetch failed (plugin still starts -- degraded > down).
         self._live_fields: Optional[set] = None
         self._date_fields: set = set()
+        # Share of the municipality the layer's extent covers, or None
+        # when it could not be computed.
+        self._coverage_pct: Optional[float] = None
+        # Lazily-built map of de-hyphenated zoning code -> stored spellings.
+        self._zoning_variants: Optional[Dict[str, List[str]]] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -401,6 +417,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         return True
 
     def _capture_layer_meta(self, meta: Dict[str, Any]) -> None:
+        self._coverage_pct = _anchorage_coverage_pct(meta.get("extent"))
         fields = meta.get("fields") or []
         self._live_fields = {f.get("name") for f in fields if f.get("name")}
         self._date_fields = {
@@ -522,6 +539,95 @@ class AnchorageParcelsPlugin(MCPPlugin):
             return None
         field = self._f("parcel_id")
         return f"{field} IS NOT NULL AND {field} <> ''"
+
+    async def _zoning_variant_map(self) -> Dict[str, List[str]]:
+        """De-hyphenated zoning code -> every spelling stored on the layer.
+
+        This field is NOT normalized: `B2C` (680 records) and `B-2C` (1)
+        are distinct stored values, likewise `CER1A`/`CE-R1A` and
+        `I2`/`I-2`. A caller filtering on one spelling silently misses the
+        other. Fetched lazily and cached for the life of the container,
+        so queries that never mention zoning pay nothing, and a failure
+        degrades to "no expansion" rather than breaking the query.
+        """
+        if self._zoning_variants is not None:
+            return self._zoning_variants
+        variants: Dict[str, List[str]] = {}
+        field = self._f("zoning")
+        try:
+            data = await self._layer_query(
+                f"{self.plugin_config.property_layer_url}/query",
+                {
+                    "f": "json",
+                    "where": "1=1",
+                    "outFields": field,
+                    "returnDistinctValues": "true",
+                    "returnGeometry": "false",
+                    "resultRecordCount": "2000",
+                },
+            )
+            for feature in data.get("features") or []:
+                value = ((feature.get("attributes") or {}).get(field) or "").strip()
+                if value:
+                    variants.setdefault(value.replace("-", "").upper(), []).append(
+                        value
+                    )
+        except Exception:
+            # Never let this optional convenience break a real query.
+            logger.warning("Could not fetch %s variants; skipping expansion", field)
+            variants = {}
+        self._zoning_variants = variants
+        return variants
+
+    async def _expand_zoning_variants(self, where: str, caveats: "_Caveats") -> str:
+        """Rewrite `Zoning_District = 'X'` to cover every stored spelling."""
+        field = self._f("zoning")
+        pattern = re.compile(re.escape(field) + r"\s*=\s*'([^']*)'")
+        if not pattern.search(where):
+            return where
+        variant_map = await self._zoning_variant_map()
+        if not variant_map:
+            return where
+
+        folded: List[str] = []
+
+        def replace(m: "re.Match[str]") -> str:
+            value = m.group(1)
+            siblings = variant_map.get(value.replace("-", "").upper(), [])
+            others = [v for v in siblings if v != value]
+            if not others:
+                return m.group(0)
+            folded.extend(others)
+            quoted = ",".join(self._sql_quote(v) for v in sorted(siblings))
+            return f"{field} IN ({quoted})"
+
+        rewritten = pattern.sub(replace, where)
+        if folded:
+            caveats.add(
+                "zoning_variants_matched",
+                f"**{field} IS NOT NORMALIZED:** also matched "
+                f"{', '.join(repr(v) for v in sorted(set(folded)))}, which "
+                f"differ only by hyphenation. Filtering on one spelling "
+                f"alone would have silently missed those records.",
+            )
+        return rewritten
+
+    def _coverage_caveat(self) -> Optional[str]:
+        """Warn when the layer does not cover the whole municipality.
+
+        The GIS server emits this for the SAME layer; without it a caller
+        here has no way to know that Girdwood and outer Eagle River are
+        systematically under-represented in an aggregate answer. Silent
+        when coverage could not be computed, rather than guessed.
+        """
+        if self._coverage_pct is None or self._coverage_pct >= self.COVERAGE_THRESHOLD:
+            return None
+        pct_int = max(1, int(round(self._coverage_pct * 100)))
+        return (
+            f"**LIMITED COVERAGE:** this layer's extent covers "
+            f"~{pct_int}% of Anchorage. Confirm the question's area of "
+            f"interest falls inside the layer's coverage."
+        )
 
     @staticmethod
     def _unassessed_caveat(include_unassessed: Any) -> Optional[str]:
@@ -1458,9 +1564,26 @@ class AnchorageParcelsPlugin(MCPPlugin):
         owner_field = self._f("owner_name")
         include_unassessed = bool(args.get("include_unassessed", False))
         assessed_clause = self._assessed_clause(include_unassessed)
+        match = str(args.get("match") or "contains").strip().lower()
+        if match not in self.OWNER_MATCH_MODES:
+            raise ToolInputError(
+                f"match must be one of {list(self.OWNER_MATCH_MODES)} (got {match!r})."
+            )
         needle = name.upper().replace("'", "''")
+        if match == "starts_with":
+            owner_clause = f"UPPER({owner_field}) LIKE '{needle}%'"
+        elif match == "surname":
+            # Names are stored surname-first, so the surname is the text
+            # before the first space -- or the whole value when it is the
+            # only token.
+            owner_clause = (
+                f"(UPPER({owner_field}) LIKE '{needle} %' "
+                f"OR UPPER({owner_field}) = '{needle}')"
+            )
+        else:
+            owner_clause = f"UPPER({owner_field}) LIKE '%{needle}%'"
         where = self._combine_where(
-            f"UPPER({owner_field}) LIKE '%{needle}%'",
+            owner_clause,
             category_clause,
             assessed_clause,
         )
@@ -1498,6 +1621,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             self._envelope(
                 {
                     "name": name,
+                    "match": match,
                     "category": args.get("category"),
                     "include_unassessed": include_unassessed,
                     "where": where,
@@ -1797,6 +1921,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
             ) from None
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
+        # Caveats are collected from here on, because the zoning expansion
+        # below needs somewhere to report what it folded in.
+        caveats = _Caveats()
+        where = await self._expand_zoning_variants(where, caveats)
         full_where = self._combine_where(
             where, category_clause, self._assessed_clause(include_unassessed)
         )
@@ -1811,9 +1939,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
         (records, exceeded), total = await asyncio.gather(
             records_task, self._fetch_count(full_where)
         )
-        caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
         caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
+        caveats.add("limited_coverage", self._coverage_caveat())
 
         remaining = None
         if total is not None:
@@ -1874,6 +2002,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
     # ── Tool: parcel_stats ────────────────────────────────────────────
 
+    # search_by_owner matching modes. Owner names are stored
+    # surname-first and UPPERCASE, so a surname search is expressible --
+    # but only if the caller knows the storage convention.
+    OWNER_MATCH_MODES = ("contains", "starts_with", "surname")
+
     STAT_TYPES = (
         "count",
         "sum",
@@ -1904,6 +2037,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         WhereValidator.validate_against_schema(where, self._live_fields)
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
+        caveats = _Caveats()
+        where = await self._expand_zoning_variants(where, caveats)
         full_where = self._combine_where(
             where, category_clause, self._assessed_clause(include_unassessed)
         )
@@ -1948,8 +2083,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         stat_label = stat_type
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
-        caveats = _Caveats()
         caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
+        caveats.add("limited_coverage", self._coverage_caveat())
         query = {
             "stat_type": stat_type,
             "include_unassessed": include_unassessed,
@@ -2044,6 +2179,34 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "Excludes ~1,000 geometry-only records with no assessment "
             "data; pass include_unassessed=True to include them."
         )
+        counting_traps_note = (
+            "COUNTING TRAPS: (1) Total_Living_Units cannot be summed "
+            "naively -- every condo parcel repeats its whole building's "
+            "unit total and Land_Use='Lease Master' rows duplicate "
+            "apartment entries; count condo parcels as one unit each and "
+            "sum Total_Living_Units only where Land_Use NOT LIKE 'Condo%' "
+            "AND Land_Use <> 'Lease Master'. (2) Property_Type='Residential' "
+            "UNDERCOUNTS dwellings -- apartment buildings are classified "
+            "'Commercial'. (3) Miscoded outliers exist (a mini-warehouse at "
+            "10880 Mausel St carries 423 'living units'; a single-family "
+            "home at 20490 Icefall Dr carries 101) -- cross-validate "
+            "against Land_Use. (4) Land_Use is an ASSESSOR CLASSIFICATION, "
+            "not a use survey: 'Religious' includes parsonages, vacant "
+            "hold-land and parking remnants, not just sanctuaries."
+        )
+        owner_match_schema = {
+            "type": "string",
+            "enum": list(AnchorageParcelsPlugin.OWNER_MATCH_MODES),
+            "default": "contains",
+            "description": (
+                "How to match the name. Owner names are stored "
+                "SURNAME-FIRST and UPPERCASE. 'contains' (default) is best "
+                "for discovery but matches longer surnames sharing the "
+                "prefix -- 'Babb' also returns Babbitt, Babbie and Babbe. "
+                "'starts_with' anchors at the start. 'surname' matches the "
+                "surname token exactly ('BABB ...' or exactly 'BABB')."
+            ),
+        }
         include_unassessed_schema = {
             "type": "boolean",
             "default": False,
@@ -2063,7 +2226,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "description": (
                 "Record category: 'Parcel' (regular parcels, the "
                 "default), 'Lease' (leased government land), 'Economic' "
-                "(multi-parcel economic units), or 'All'."
+                "(multi-parcel economic units), or 'All'. Parcel_ID is "
+                "NOT unique: multipart parcels produce several polygon "
+                "features per ID, and Lease/Economic records stack on top "
+                "of Parcel records at the same location. Defaulting to "
+                "'Parcel' is what stops those duplicates inflating counts "
+                "-- pass 'All' only when you want the overlays too."
             ),
         }
         rows_payload = {
@@ -2389,6 +2557,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             "default": 20,
                             "description": "Max records (1-1000)",
                         },
+                        "match": owner_match_schema,
                         "category": category_schema,
                         "include_unassessed": include_unassessed_schema,
                     },
@@ -2475,7 +2644,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f'Appraised_Total_Value > 1000000", order_by='
                     f"'Appraised_Total_Value DESC'). Text values are "
                     f"stored UPPERCASE; {CASE_SENSITIVE_NOTE} "
-                    f"{summary_note} {unassessed_note} {routing_note}"
+                    f"{summary_note} {unassessed_note} {counting_traps_note} "
+                    f"{routing_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -2528,7 +2698,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"parcel_stats(stat_type='percentile_cont', "
                     f"stat_field='Appraised_Total_Value', "
                     f"group_by='Zoning_District'). {CASE_SENSITIVE_NOTE} "
-                    f"{unassessed_note} {routing_note}"
+                    f"{unassessed_note} {counting_traps_note} {routing_note}"
                 ),
                 input_schema={
                     "type": "object",
