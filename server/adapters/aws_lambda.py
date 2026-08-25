@@ -95,9 +95,9 @@ def lambda_handler(
         # Handle OPTIONS requests for CORS preflight
         if http_method == "OPTIONS":
             handler = get_handler()
-            preflight_origin = (event.get("headers") or {}).get(
-                "origin"
-            ) or (event.get("headers") or {}).get("Origin")
+            preflight_origin = (event.get("headers") or {}).get("origin") or (
+                event.get("headers") or {}
+            ).get("Origin")
             status_code, headers, body = handler.handle_options(
                 request_id=request_id,
                 request_origin=preflight_origin,
@@ -204,9 +204,9 @@ def lambda_handler(
         # Reflect Origin against the allowlist so even error responses
         # respect CORS scope. Browsers ignore mismatches; native clients
         # ignore CORS entirely.
-        error_origin = (event.get("headers") or {}).get(
-            "origin"
-        ) or (event.get("headers") or {}).get("Origin")
+        error_origin = (event.get("headers") or {}).get("origin") or (
+            event.get("headers") or {}
+        ).get("Origin")
         # Don't leak exception details to the client; full traceback is in
         # CloudWatch via logger.error(..., exc_info=True) above.
         error_cors = UniversalHTTPHandler._get_cors_headers(error_origin)

@@ -38,21 +38,8 @@ jobs:
       - name: Ruff lint
         run: ruff check core/ plugins/ server/ tests/
 
-      # These eight files carry formatting drift that predates the gate.
-      # Excluding them lets the gate block NEW drift today rather than
-      # waiting on a repo-wide reformat. The list should only ever shrink;
-      # delete an entry once its file is formatted.
       - name: Ruff format
-        run: |
-          ruff format --check core/ plugins/ server/ tests/ \
-            --exclude plugins/anchorage_gis/config_schema.py \
-            --exclude plugins/anchorage_gis/plugin.py \
-            --exclude plugins/arcgis/where_validator.py \
-            --exclude server/adapters/aws_lambda.py \
-            --exclude server/http_handler.py \
-            --exclude tests/test_anchorage_gis_plugin.py \
-            --exclude tests/test_arcgis_plugin.py \
-            --exclude tests/test_http_handler.py
+        run: ruff format --check core/ plugins/ server/ tests/
 
       # config.yaml is gitignored, so CI validates the tracked source this
       # fork actually deploys from.
