@@ -93,24 +93,3 @@ resource "aws_cloudwatch_metric_alarm" "apigw_5xx" {
   alarm_actions = local.alarm_actions
   ok_actions    = local.alarm_actions
 }
-
-resource "aws_cloudwatch_metric_alarm" "apigw_4xx_probing" {
-  alarm_name          = "${local.lambda_name}-apigw-4xx-probing"
-  alarm_description   = "Elevated 4XX rate — likely probing or abusive client"
-  namespace           = "AWS/ApiGateway"
-  metric_name         = "4XXError"
-  statistic           = "Sum"
-  period              = 300
-  evaluation_periods  = 1
-  threshold           = 100
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  treat_missing_data  = "notBreaching"
-
-  dimensions = {
-    ApiName = aws_api_gateway_rest_api.mcp_api.name
-    Stage   = aws_api_gateway_stage.prod.stage_name
-  }
-
-  alarm_actions = local.alarm_actions
-  ok_actions    = local.alarm_actions
-}
