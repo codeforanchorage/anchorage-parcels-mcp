@@ -1,8 +1,12 @@
-"""Ad-hoc production smoke test for the Anchorage GIS MCP server.
+"""Ad-hoc production smoke test for the Anchorage Parcels MCP server.
 
 Exercises the JSON-RPC surface and the core tool chain end-to-end
 against the live Lambda. Read-only; paces calls to stay under the
 API Gateway rate limit (5 rps) and WAF per-IP cap (300/5min).
+
+The fuller, assert-on-first-failure suite is scripts/smoke_http.py;
+this one keeps going and prints a pass/fail line per check so a
+partial outage is visible at a glance.
 """
 
 import json
@@ -10,7 +14,15 @@ import sys
 import time
 import urllib.request
 
-URL = "https://622f4qcew8.execute-api.us-west-2.amazonaws.com/prod/mcp"
+URL = "https://anchorage-parcels.codeforanchorage.org/mcp"
+SERVER_NAME = "Anchorage Parcels MCP"
+TOOL_PREFIX = "anchorage_parcels__"
+N_TOOLS = 7
+# Known fixtures (see scripts/smoke_http.py): a single-record parcel and
+# a 24-unit condo root whose details call must list every unit.
+FIXTURE_PARCEL = "002-151-32"
+CONDO_ROOT = "012-182-04"
+
 _id = 0
 PASS = "PASS"
 FAIL = "FAIL"
@@ -36,7 +48,7 @@ def rpc(method, params=None):
 
 
 def call_tool(name, args):
-    return rpc("tools/call", {"name": f"anchorage_gis__{name}", "arguments": args})
+    return rpc("tools/call", {"name": f"{TOOL_PREFIX}{name}", "arguments": args})
 
 
 def text_of(resp):
@@ -49,14 +61,14 @@ def check(label, ok, detail=""):
     print(f"[{mark}] {label}" + (f" -- {detail}" if detail else ""))
 
 
-# 1. ping
+# 1. ping: the spec result is an empty object; the response IS the signal
 try:
     r = rpc("ping")
-    check("ping", r.get("result", {}).get("status") == "ok", str(r.get("result")))
+    check("ping", r.get("result") == {}, str(r.get("result")))
 except Exception as e:
     check("ping", False, repr(e))
 
-# 2. initialize
+# 2. initialize: configured serverInfo name, requested version echoed
 try:
     r = rpc(
         "initialize",
@@ -65,11 +77,9 @@ try:
     )
     si = r["result"]["serverInfo"]
     pv = r["result"]["protocolVersion"]
-    # serverInfo now reports the configured name (was hardcoded "opencontext"),
-    # and the server echoes the client's requested protocol version.
     check(
         "initialize",
-        si["name"] == "Anchorage GIS MCP" and pv == "2025-03-26",
+        si["name"] == SERVER_NAME and pv == "2025-03-26",
         json.dumps({"serverInfo": si, "protocolVersion": pv}),
     )
 except Exception as e:
@@ -79,110 +89,102 @@ except Exception as e:
 try:
     r = rpc("tools/list")
     tools = [t["name"] for t in r["result"]["tools"]]
-    check("tools/list", len(tools) == 14, f"{len(tools)} tools")
+    check("tools/list", len(tools) == N_TOOLS, f"{len(tools)} tools")
 except Exception as e:
     check("tools/list", False, repr(e))
 
-# 4. find_gis_content (discovery)
+# 4. find_parcel: fixture record, hyphenated 8-digit form
 try:
-    r = call_tool("find_gis_content", {"topic": "parks", "limit": 6})
+    r = call_tool("find_parcel", {"parcel_id": FIXTURE_PARCEL})
     t = text_of(r)
-    check("find_gis_content(parks)", "ID:" in t, f"{len(t)} chars")
+    check("find_parcel", "00215132000" in t and "144 W 15TH AVE" in t,
+          f"{len(t)} chars")
 except Exception as e:
-    check("find_gis_content(parks)", False, repr(e))
+    check("find_parcel", False, repr(e))
 
-# 5. search_spatial_layers -> grab a Feature Service id
-fs_id = None
+# 5. get_parcel_details: single record renders valuation + Datalet link
 try:
-    r = call_tool(
-        "search_spatial_layers",
-        {"query": "parks", "layer_type": "layers", "limit": 8},
-    )
-    import re
+    r = call_tool("get_parcel_details", {"parcel_id": FIXTURE_PARCEL})
     t = text_of(r)
-    m = re.search(r"_Feature Service_\s*--\s*ID: `([0-9a-f]{32})`", t)
-    fs_id = m.group(1) if m else None
-    check("search_spatial_layers", fs_id is not None, f"picked {fs_id}")
+    check("get_parcel_details", "## Valuation" in t and "Datalet" in t,
+          f"{len(t)} chars")
 except Exception as e:
-    check("search_spatial_layers", False, repr(e))
+    check("get_parcel_details", False, repr(e))
 
-# 6. get_item_details
-if fs_id:
-    try:
-        r = call_tool("get_item_details", {"item_id": fs_id})
-        t = text_of(r)
-        check("get_item_details", "ID:" in t and "Type:" in t, f"{len(t)} chars")
-    except Exception as e:
-        check("get_item_details", False, repr(e))
-
-# 7. get_layer_schema -> capture a field name
-field = None
+# 6. get_parcel_details on a condo root: every unit, no truncation
 try:
-    r = call_tool("get_layer_schema", {"item_id": fs_id})
+    r = call_tool("get_parcel_details", {"parcel_id": CONDO_ROOT})
     t = text_of(r)
-    import re
-    # schema lists fields; grab a plausible text field name
-    names = re.findall(r"`([A-Za-z][A-Za-z0-9_]{2,})`", t)
-    field = next((n for n in names if n not in ("OBJECTID", "Shape")), None)
-    check("get_layer_schema", bool(names), f"field sample: {field}")
+    ok = "matches 24 records" in t and "01218204024" in t and "TRUNCATED" not in t
+    check("get_parcel_details (condo root, 24 units)", ok,
+          t.splitlines()[0][:80] if t else "(empty)")
 except Exception as e:
-    check("get_layer_schema", False, repr(e))
+    check("get_parcel_details (condo root, 24 units)", False, repr(e))
 
-# 8. query_data count (limit=1 -> TOTAL COUNT)
+# 7. search_by_address
 try:
-    r = call_tool("query_data", {"item_id": fs_id, "limit": 1})
+    r = call_tool("search_by_address", {"address": "632 W 6TH AVE", "limit": 5})
     t = text_of(r)
-    check("query_data count", "TOTAL COUNT" in t, t.split("\n")[3][:80] if len(t.split("\n")) > 3 else t[:80])
+    check("search_by_address", "Record 1:" in t, f"{len(t)} chars")
 except Exception as e:
-    check("query_data count", False, repr(e))
+    check("search_by_address", False, repr(e))
 
-# 9. query_data listing (limit=3)
-try:
-    r = call_tool("query_data", {"item_id": fs_id, "limit": 3})
-    t = text_of(r)
-    ok = "Record 1:" in t and "results above are a sample" not in t
-    check("query_data listing (no stale reminder)", ok,
-          "trimmed reminder absent" if ok else "stale text present")
-except Exception as e:
-    check("query_data listing (no stale reminder)", False, repr(e))
-
-# 10. get_distinct_values
-if field:
-    try:
-        r = call_tool("get_distinct_values", {"item_id": fs_id, "field": field, "limit": 10})
-        t = text_of(r)
-        check("get_distinct_values", "isError" not in r.get("result", {}), f"field={field}")
-    except Exception as e:
-        check("get_distinct_values", False, repr(e))
-
-# 11. spatial_query_point on a polygon layer (Park Land), point in Anchorage
+# 8. search_by_owner (names are stored UPPERCASE; the tool handles case)
 try:
     r = call_tool(
-        "spatial_query_point",
-        {"item_id": "466c5b7adafe4468aebcc29347e8c84e", "lon": -149.85, "lat": 61.19},
+        "search_by_owner", {"name": "municipality of anchorage", "limit": 3}
     )
     t = text_of(r)
-    check("spatial_query_point", bool(t), t.split("\n")[0][:80])
+    check("search_by_owner", "Record 1:" in t, f"{len(t)} chars")
 except Exception as e:
-    check("spatial_query_point", False, repr(e))
+    check("search_by_owner", False, repr(e))
 
-# 12. error handling: query a viewer (Web Mapping App) -> graceful, actionable error
+# 9. parcels_at_point: downtown Anchorage
 try:
-    r = call_tool("query_data", {"item_id": "b4c05a8ee42d4d44b8c6eb27b5d0158f", "limit": 2})
+    r = call_tool("parcels_at_point", {"lat": 61.2163, "lon": -149.8949})
     t = text_of(r)
-    ok = "not a queryable" in t and "find_gis_content" in t
-    check("error handling (viewer rejected gracefully)", ok, t[:80])
+    check("parcels_at_point", "Parcel_ID" in t, t.split("\n")[0][:80])
 except Exception as e:
-    check("error handling (viewer rejected gracefully)", False, repr(e))
+    check("parcels_at_point", False, repr(e))
 
-# 13. error handling: bad field -> 'did you mean' / schema recovery hint
+# 10. parcel_stats: assessed Parcel count is ~97k
 try:
-    r = call_tool("query_data", {"item_id": fs_id, "where": "Nonexistent_Field='x'"})
+    r = call_tool("parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"})
     t = text_of(r)
-    ok = ("get_layer_schema" in t) or ("does not exist" in t) or ("CASE-SENSITIVE" in t)
-    check("error handling (bad field -> recovery hint)", ok, t[:90])
+    count = 0
+    for line in t.splitlines():
+        digits = line.strip().lstrip("- ").replace(",", "")
+        if digits.isdigit():
+            count = int(digits)
+    check("parcel_stats count > 90,000", count > 90_000, f"{count:,}")
 except Exception as e:
-    check("error handling (bad field -> recovery hint)", False, repr(e))
+    check("parcel_stats count > 90,000", False, repr(e))
+
+# 11. query_parcels: WHERE plus TOTAL COUNT metadata
+try:
+    r = call_tool("query_parcels", {"where": "Zoning_District = 'RO'", "limit": 2})
+    t = text_of(r)
+    check("query_parcels", "TOTAL COUNT" in t, f"{len(t)} chars")
+except Exception as e:
+    check("query_parcels", False, repr(e))
+
+# 12. error handling: unknown tool is a -32602 protocol error, not -32603
+try:
+    r = call_tool("nope", {})
+    err = r.get("error", {})
+    ok = err.get("code") == -32602 and "available_tools" in (err.get("data") or {})
+    check("error handling (unknown tool -> -32602)", ok, json.dumps(err)[:80])
+except Exception as e:
+    check("error handling (unknown tool -> -32602)", False, repr(e))
+
+# 13. error handling: bad field -> readable tool error naming the field
+try:
+    r = call_tool("query_parcels", {"where": "Nonexistent_Field='x'", "limit": 1})
+    t = text_of(r)
+    ok = bool(r["result"].get("isError")) and "Nonexistent_Field" in t
+    check("error handling (bad field -> named in error)", ok, t[:90])
+except Exception as e:
+    check("error handling (bad field -> named in error)", False, repr(e))
 
 print("\n=== SUMMARY ===")
 n_pass = sum(1 for _, ok in results if ok)
