@@ -14,6 +14,7 @@ from core.interfaces import PluginType
 from plugins.arcgis.config_schema import ArcGISPluginConfig
 from plugins.arcgis.plugin import ArcGISPlugin
 from plugins.arcgis.where_validator import WhereValidator
+from core.interfaces import ToolInputError
 
 
 @pytest.fixture
@@ -430,3 +431,29 @@ class TestConfigSchema:
                 portal_url="not-a-url",
                 city_name="Boston",
             )
+
+
+class TestWhereValidatorSchemaHint:
+    """The trailing recovery hint is per-plugin: the default names the
+    GIS/arcgis `get_layer_schema` tool, and a plugin that lacks that tool
+    (anchorage_parcels) supplies its own so callers are not sent to a
+    tool that does not exist on their server."""
+
+    def test_default_hint_names_get_layer_schema(self):
+        with pytest.raises(ToolInputError) as exc:
+            WhereValidator.validate_against_schema("XYZQR='foo'", {"STATUS"})
+        assert str(exc.value).endswith(WhereValidator.DEFAULT_SCHEMA_HINT)
+        assert "get_layer_schema" in str(exc.value)
+
+    def test_custom_hint_replaces_default(self):
+        with pytest.raises(ToolInputError) as exc:
+            WhereValidator.validate_against_schema(
+                "XYZQR='foo'", {"STATUS"}, schema_hint="Use my_tool instead."
+            )
+        assert str(exc.value).endswith("Use my_tool instead.")
+        assert "get_layer_schema" not in str(exc.value)
+
+    def test_empty_hint_falls_back_to_default(self):
+        with pytest.raises(ToolInputError) as exc:
+            WhereValidator.validate_against_schema("XYZQR='foo'", {"STATUS"}, "")
+        assert "get_layer_schema" in str(exc.value)

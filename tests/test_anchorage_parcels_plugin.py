@@ -983,6 +983,37 @@ class TestQueryParcels:
         assert "Zoning_District" in result.error_message
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool, args",
+        [
+            ("query_parcels", {"where": "Nonexistent_Field='x'"}),
+            (
+                "parcel_stats",
+                {
+                    "stat_type": "count",
+                    "stat_field": "Parcel_ID",
+                    "where": "Nonexistent_Field='x'",
+                },
+            ),
+        ],
+    )
+    async def test_unknown_field_hint_names_this_servers_tools(
+        self, plugin, tool, args
+    ):
+        """The shared WhereValidator's default recovery hint says "Call
+        get_layer_schema" -- a tool on the Anchorage GIS server, not this
+        one. The hint here must point at something a caller of THIS
+        server can actually do."""
+        install_client(plugin)
+        result = await run_tool(plugin, tool, args)
+        assert result.success is False
+        msg = result.error_message
+        assert "Nonexistent_Field" in msg
+        assert "get_layer_schema" not in msg
+        assert "query_parcels" in msg and "out_fields='*'" in msg
+        assert "Parcel_ID" in msg  # the summary-field list is spelled out
+
+    @pytest.mark.asyncio
     async def test_bad_order_by_rejected(self, plugin):
         install_client(plugin)
         result = await run_tool(
