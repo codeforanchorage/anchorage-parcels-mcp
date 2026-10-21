@@ -16,7 +16,7 @@ from core.logging_utils import (
     format_request_log,
     format_response_log,
 )
-from core.mcp_server import MCPServer
+from core.mcp_server import ERA_MODERN, MCPServer
 from core.plugin_manager import PluginManager
 from core.validators import (
     ConfigurationError,
@@ -359,8 +359,10 @@ class UniversalHTTPHandler:
         try:
             request_json = json.loads(body)
             is_initialize = request_json.get("method") == "initialize"
+            is_modern = MCPServer.request_era(request_json, headers) == ERA_MODERN
         except (json.JSONDecodeError, AttributeError):
             is_initialize = False
+            is_modern = False
 
         # Validate the MCP-Protocol-Version header (spec: transports,
         # Protocol Version Header). `initialize` is exempt: the header is
@@ -369,6 +371,12 @@ class UniversalHTTPHandler:
         # would deadlock a client whose first attempt names a revision we
         # do not support -- it could never reach the handshake that would
         # settle on one we do.
+        #
+        # Both legacy (2025-11-25 and earlier, initialize handshake) and
+        # modern (2026-07-28+, per-request _meta) revisions pass through
+        # here -- see core/mcp_server.py for the split; the modern era's
+        # header/body consistency checks happen there, once the body has
+        # been parsed.
         protocol_version = headers.get("mcp-protocol-version") if headers else None
         if (
             protocol_version is not None
@@ -376,24 +384,24 @@ class UniversalHTTPHandler:
             and protocol_version not in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
         ):
             duration_ms = (time.perf_counter() - start_time) * 1000
-            # Deliberately -32600 and NOT -32022
-            # (UnsupportedProtocolVersionError). Per the 2026-07-28
-            # compatibility matrix a dual-era client reads a 4xx with no
-            # recognized modern error body as "legacy server" and falls
-            # back to the initialize handshake, which is exactly what this
-            # server wants. Returning -32022 would advertise a modern
-            # server this is not, and the client would retry rather than
-            # fall back.
+            # A version we implement in neither era gets the modern
+            # UnsupportedProtocolVersionError (-32022) listing what we do
+            # support: a modern client retries with one of those, and a
+            # legacy client at least sees a version it can ask for on
+            # initialize. (This used to be a bare -32600 on purpose, so
+            # that dual-era clients would fall back to initialize; now
+            # that we are dual-era ourselves that fallback would cost them
+            # a round trip for nothing.)
             error_body = json.dumps(
                 {
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {
-                        "code": -32600,
-                        "message": "Unsupported MCP-Protocol-Version",
+                        "code": -32022,
+                        "message": "Unsupported protocol version",
                         "data": {
-                            "requested": protocol_version,
                             "supported": list(MCPServer.SUPPORTED_PROTOCOL_VERSIONS),
+                            "requested": protocol_version,
                         },
                     },
                 }
@@ -426,7 +434,12 @@ class UniversalHTTPHandler:
                 extra={"request_id": request_id, "mcp_session_id": session_id},
             )
 
-        effective_session_id = session_id or incoming_session_id
+        # Modern-era (2026-07-28) requests have no session: an
+        # Mcp-Session-Id a client sends anyway is ignored, never echoed or
+        # logged as if it correlated anything.
+        effective_session_id = (
+            None if is_modern else (session_id or incoming_session_id)
+        )
 
         # Log request details
         request_log_data = format_request_log(
