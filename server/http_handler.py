@@ -350,14 +350,19 @@ class UniversalHTTPHandler:
                 error_body,
             )
 
-        # Parse JSON to check if this is an initialize request
+        # Parse JSON once up front: to echo the JSON-RPC id on the
+        # transport-level version error below (the spec's
+        # UnsupportedProtocolVersionError example carries the request's id,
+        # and a client correlating in-flight requests needs it), to detect
+        # initialize requests and mint a session ID, and to classify the era.
         # NOTE: This is intentionally parsing the JSON body separately from the
-        # later parsing in _mcp_server.handle_http_request(). This early parsing
-        # allows us to detect initialize requests and generate session IDs without
-        # affecting error handling if the JSON is invalid. The body will be parsed
-        # again later, which is an acceptable trade-off for error handling isolation.
+        # later parsing in _mcp_server.handle_http_request(), so a malformed
+        # body still gets that method's -32700 handling. The body is small;
+        # parsing it twice is an acceptable trade-off for error isolation.
+        body_request_id = None
         try:
             request_json = json.loads(body)
+            body_request_id = request_json.get("id")
             is_initialize = request_json.get("method") == "initialize"
             is_modern = MCPServer.request_era(request_json, headers) == ERA_MODERN
         except (json.JSONDecodeError, AttributeError):
@@ -395,7 +400,7 @@ class UniversalHTTPHandler:
             error_body = json.dumps(
                 {
                     "jsonrpc": "2.0",
-                    "id": None,
+                    "id": body_request_id,
                     "error": {
                         "code": -32022,
                         "message": "Unsupported protocol version",

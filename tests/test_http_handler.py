@@ -328,7 +328,47 @@ class TestProtocolVersionHeader:
         assert error["data"]["supported"] == list(MCPServer.SUPPORTED_PROTOCOL_VERSIONS)
         assert error["data"]["supported"][0] == "2026-07-28"
         assert "2025-11-25" in error["data"]["supported"]
+        # The spec's own UnsupportedProtocolVersionError example echoes
+        # the request id; a client with several requests in flight needs
+        # it to know which one was refused. This used to be null.
+        assert json.loads(body)["id"] == 1
         mock_mcp_server.handle_http_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unsupported_version_without_id_keeps_null_id(self):
+        """A notification (no id) or an unparseable body cannot be
+        correlated, so the error keeps a null id rather than inventing
+        one."""
+        handler = UniversalHTTPHandler()
+
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock()
+
+            status, _, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps(
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                ),
+                headers={"mcp-protocol-version": "1999-01-01"},
+            )
+            assert status == 400
+            assert json.loads(body)["id"] is None
+
+            status, _, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body="{not json",
+                headers={"mcp-protocol-version": "1999-01-01"},
+            )
+            assert status == 400
+            assert json.loads(body)["id"] is None
+            assert json.loads(body)["error"]["code"] == -32022
+
+            mock_mcp_server.handle_http_request.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_modern_version_header_is_accepted(self):

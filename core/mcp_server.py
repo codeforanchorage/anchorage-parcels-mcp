@@ -282,6 +282,14 @@ class MCPServer:
             request_log_data["mcp_protocol_version"] = declared_version
         if session_id:
             request_log_data["mcp_session_id"] = session_id
+        # W3C trace context, if the client propagates it (spec 2026-07-28
+        # "_meta" OpenTelemetry conventions). Flattened so a CloudWatch
+        # query can join our request line to the caller's trace. `baggage`
+        # is deliberately not copied: it is free-form key/values.
+        for key in ("traceparent", "tracestate"):
+            value = meta.get(key)
+            if isinstance(value, str) and value:
+                request_log_data[f"otel_{key}"] = value
         logger.info("JSON-RPC request received", extra=request_log_data)
 
         try:
