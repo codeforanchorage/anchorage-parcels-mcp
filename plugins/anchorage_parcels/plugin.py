@@ -505,6 +505,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
         return ",".join(self._f(k) for k in SUMMARY_LOGICAL_FIELDS)
 
     @property
+    def _schema_hint(self) -> str:
+        """Recovery hint for an unknown field in a WHERE clause.
+
+        The shared WhereValidator defaults to "Call get_layer_schema",
+        which is a tool on the Anchorage GIS server, not this one -- a
+        caller following that advice here gets -32602 Unknown tool. Point
+        at what exists on this server instead.
+        """
+        return (
+            f"{CASE_SENSITIVE_NOTE} The summary fields are: "
+            f"{self._summary_fields}. Use query_parcels with "
+            f"out_fields='*' and limit=1 to see every field."
+        )
+
+    @property
     def _parcel_id_fields(self) -> List[str]:
         """The five columns a parcel number may be stored in."""
         return [
@@ -1906,7 +1921,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if not raw_where:
             raise ToolInputError("where is required (use '1=1' to match everything)")
         where = WhereValidator.validate(raw_where)
-        WhereValidator.validate_against_schema(where, self._live_fields)
+        WhereValidator.validate_against_schema(
+            where, self._live_fields, schema_hint=self._schema_hint
+        )
         out_fields = self._validate_out_fields(args.get("out_fields"))
         order_by = OrderByValidator.validate(str(args.get("order_by") or ""))
         limit, clamp_note = self._clamp_limit(args, default=100, maximum=self.MAX_LIMIT)
@@ -2034,7 +2051,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             group_by = self._check_field_exists(group_by, "group_by")
         raw_where = str(args.get("where") or "").strip()
         where = WhereValidator.validate(raw_where or "1=1")
-        WhereValidator.validate_against_schema(where, self._live_fields)
+        WhereValidator.validate_against_schema(
+            where, self._live_fields, schema_hint=self._schema_hint
+        )
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
         caveats = _Caveats()
