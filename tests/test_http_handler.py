@@ -318,32 +318,125 @@ class TestProtocolVersionHeader:
 
         assert status == 400
         error = json.loads(body)["error"]
-        assert error["code"] == -32600
+        # A revision we implement in NEITHER era gets the modern
+        # UnsupportedProtocolVersionError, listing every version we do
+        # serve so the client can retry with one. (This was a bare -32600
+        # while the server was legacy-only, so dual-era clients would
+        # fall back to initialize instead of retrying.)
+        assert error["code"] == -32022
         assert error["data"]["requested"] == "1999-01-01"
         assert error["data"]["supported"] == list(MCPServer.SUPPORTED_PROTOCOL_VERSIONS)
+        assert error["data"]["supported"][0] == "2026-07-28"
+        assert "2025-11-25" in error["data"]["supported"]
+        # The spec's own UnsupportedProtocolVersionError example echoes
+        # the request id; a client with several requests in flight needs
+        # it to know which one was refused. This used to be null.
+        assert json.loads(body)["id"] == 1
         mock_mcp_server.handle_http_request.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_does_not_return_unsupported_protocol_version_error_code(self):
-        """Deliberately NOT -32022.
+    async def test_unsupported_version_without_id_keeps_null_id(self):
+        """A notification (no id) or an unparseable body cannot be
+        correlated, so the error keeps a null id rather than inventing
+        one."""
+        handler = UniversalHTTPHandler()
 
-        Per the 2026-07-28 compatibility matrix a dual-era client reads a
-        4xx with no recognized MODERN error body as "this is a legacy
-        server" and falls back to the initialize handshake -- which is
-        what this server wants. -32022 would advertise a modern server it
-        is not, and the client would retry instead of falling back.
-        """
+        with (
+            patch("server.http_handler._initialize_server"),
+            patch("server.http_handler._mcp_server") as mock_mcp_server,
+        ):
+            mock_mcp_server.handle_http_request = AsyncMock()
+
+            status, _, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps(
+                    {"jsonrpc": "2.0", "method": "notifications/initialized"}
+                ),
+                headers={"mcp-protocol-version": "1999-01-01"},
+            )
+            assert status == 400
+            assert json.loads(body)["id"] is None
+
+            status, _, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body="{not json",
+                headers={"mcp-protocol-version": "1999-01-01"},
+            )
+            assert status == 400
+            assert json.loads(body)["id"] is None
+            assert json.loads(body)["error"]["code"] == -32022
+
+            mock_mcp_server.handle_http_request.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_modern_version_header_is_accepted(self):
+        """2026-07-28 is served (dual-era), not bounced to the 400 that
+        used to cost every claude.ai / Claude Code session a fallback
+        round trip. The real MCPServer is wired in so the request runs
+        end to end: era classification, header validation, discover."""
         handler = UniversalHTTPHandler()
 
         with patch("server.http_handler._initialize_server"):
-            _, _, body = await handler.handle_request(
+            from server import http_handler
+
+            plugin_manager = MagicMock()
+            plugin_manager.config = {}
+            plugin_manager.get_all_tools.return_value = []
+            http_handler._mcp_server = MCPServer(plugin_manager)
+
+            status, headers, body = await handler.handle_request(
+                method="POST",
+                path="/mcp",
+                body=json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "server/discover",
+                        "params": {
+                            "_meta": {
+                                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                                "io.modelcontextprotocol/clientCapabilities": {},
+                            }
+                        },
+                    }
+                ),
+                headers={
+                    "mcp-protocol-version": "2026-07-28",
+                    "mcp-method": "server/discover",
+                    "mcp-session-id": "stale-legacy-session",
+                },
+            )
+
+        assert status == 200
+        assert json.loads(body)["result"]["supportedVersions"][0] == "2026-07-28"
+        # No session in the modern era: nothing minted, nothing echoed.
+        assert "Mcp-Session-Id" not in headers
+
+    @pytest.mark.asyncio
+    async def test_modern_header_with_legacy_body_is_not_served_as_legacy(self):
+        """The half-migrated case: header says 2026-07-28, body carries no
+        _meta. It is a modern request that fails header/body validation
+        (-32020, 400), not a legacy ping to quietly answer."""
+        handler = UniversalHTTPHandler()
+
+        with patch("server.http_handler._initialize_server"):
+            from server import http_handler
+
+            plugin_manager = MagicMock()
+            plugin_manager.config = {}
+            http_handler._mcp_server = MCPServer(plugin_manager)
+
+            status, _, body = await handler.handle_request(
                 method="POST",
                 path="/mcp",
                 body=self.PING,
                 headers={"mcp-protocol-version": "2026-07-28"},
             )
 
-        assert json.loads(body)["error"]["code"] != -32022
+        assert status == 400
+        assert json.loads(body)["error"]["code"] == -32020
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("version", MCPServer.SUPPORTED_PROTOCOL_VERSIONS)

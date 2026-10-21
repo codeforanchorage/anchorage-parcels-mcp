@@ -339,14 +339,10 @@ def main() -> int:
         )
         check("bad protocol version: HTTP 400", r.status_code == 400, str(r.status_code))
         err = r.json().get("error", {})
-        check("bad protocol version: -32600", err.get("code") == -32600, str(err))
+        check("bad protocol version: -32022", err.get("code") == -32022, str(err))
         check(
-            "bad protocol version: NOT -32022 (so dual-era clients fall back)",
-            err.get("code") != -32022,
-        )
-        check(
-            "bad protocol version: data lists supported revisions",
-            bool((err.get("data") or {}).get("supported")),
+            "bad protocol version: data lists supported revisions, modern first",
+            ((err.get("data") or {}).get("supported") or [None])[0] == "2026-07-28",
             json.dumps(err.get("data")),
         )
 
@@ -356,6 +352,52 @@ def main() -> int:
             headers={"MCP-Protocol-Version": "2025-06-18"},
         )
         check("supported protocol version: 200", r.status_code == 200)
+
+        # 16b. Modern era (2026-07-28): the server/discover probe every
+        #      claude.ai session opens with is served, not bounced; ping
+        #      is gone from that era. scripts/smoke_prod.py has the fuller
+        #      modern block.
+        modern_meta = {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {"name": "smoke_http", "version": "0"},
+            "io.modelcontextprotocol/clientCapabilities": {},
+        }
+        r = client.post(
+            url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "server/discover",
+                "params": {"_meta": modern_meta},
+            },
+            headers={
+                "MCP-Protocol-Version": "2026-07-28",
+                "Mcp-Method": "server/discover",
+            },
+        )
+        res = r.json().get("result", {})
+        check(
+            "modern server/discover: 200, 2026-07-28 first, resultType complete",
+            r.status_code == 200
+            and (res.get("supportedVersions") or [None])[0] == "2026-07-28"
+            and res.get("resultType") == "complete",
+            f"{r.status_code} {json.dumps(res)[:160]}",
+        )
+        r = client.post(
+            url,
+            json={
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "ping",
+                "params": {"_meta": modern_meta},
+            },
+            headers={"MCP-Protocol-Version": "2026-07-28", "Mcp-Method": "ping"},
+        )
+        check(
+            "modern ping: 404 / -32601 (not served in this era)",
+            r.status_code == 404 and r.json().get("error", {}).get("code") == -32601,
+            f"{r.status_code} {r.text[:120]}",
+        )
 
         # 17. Structured output really conforms to the schema the server
         #     itself advertises -- validated live, not against a local copy.

@@ -94,9 +94,17 @@ class TestInitialize:
 
     @pytest.mark.asyncio
     async def test_initialize_unsupported_version_falls_back(self):
-        """An unrecognized requested version (including ones newer than we
-        support, e.g. 2026-07-28) gets the newest supported version back,
-        per the spec's version-negotiation rule."""
+        """An unrecognized requested version gets the newest LEGACY version
+        back, per the spec's version-negotiation rule.
+
+        That includes 2026-07-28, even though it IS a supported version:
+        it drops the handshake entirely and is served via per-request
+        _meta (see tests/test_modern_protocol.py). Echoing it on an
+        initialize response would promise stateless semantics on a
+        session-based exchange."""
+        assert "2026-07-28" in MCPServer.SUPPORTED_PROTOCOL_VERSIONS
+        assert "2026-07-28" not in MCPServer.LEGACY_PROTOCOL_VERSIONS
+
         plugin_manager = MagicMock(spec=PluginManager)
         plugin_manager.config = {}
         server = MCPServer(plugin_manager)
@@ -803,8 +811,9 @@ class TestHTTPRequestHandling:
 
         response = await server.handle_http_request(request_body)
 
-        assert response["statusCode"] == 200
-        assert response["body"] == ""  # Empty body for notifications
+        # Streamable HTTP: an accepted notification is 202 with no body.
+        assert response["statusCode"] == 202
+        assert response["body"] == ""
 
     @pytest.mark.asyncio
     async def test_handle_http_request_preserves_headers(self):
