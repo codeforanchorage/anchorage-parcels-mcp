@@ -118,7 +118,10 @@ def lambda_handler(
             }
 
         # Extract body
-        body = event.get("body", "{}")
+        # API Gateway sends "body": null (key present) for bodiless requests,
+        # so .get()'s default never applies; json.loads(None) is a TypeError
+        # the handler doesn't catch -> 500. "" parses to a clean -32700.
+        body = event.get("body") or ""
 
         # Handle base64-encoded bodies from API Gateway
         if event.get("isBase64Encoded", False):

@@ -166,6 +166,25 @@ class TestLambdaHandler:
             assert isinstance(call_args[1]["body"], str)
             assert "jsonrpc" in call_args[1]["body"]
 
+    def test_lambda_handler_null_body_becomes_empty_string(self):
+        """API Gateway sends "body": null; it must not reach json.loads."""
+        event = {
+            "requestContext": {"http": {"method": "POST", "path": "/mcp"}},
+            "rawPath": "/mcp",
+            "body": None,
+            "headers": {},
+        }
+
+        with patch("server.adapters.aws_lambda.get_handler") as mock_get_handler:
+            mock_handler = MagicMock()
+            mock_handler.handle_request = AsyncMock(return_value=(200, {}, ""))
+            mock_get_handler.return_value = mock_handler
+
+            lambda_handler(event, MockLambdaContext())
+
+            call_args = mock_handler.handle_request.call_args
+            assert call_args[1]["body"] == ""
+
     def test_lambda_handler_lowercases_headers(self):
         """Test that headers are lowercased."""
         event = {
