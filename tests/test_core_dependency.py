@@ -53,6 +53,15 @@ def test_core_discovers_this_repos_plugins(monkeypatch):
         assert enabled in discovered
 
 
+def test_installed_core_matches_the_pin():
+    """A stale environment would otherwise test one core and ship
+    another: the pin is what deploy.sh installs."""
+    import importlib.metadata
+
+    pinned = PIN.findall((REPO_ROOT / "requirements.txt").read_text("utf-8"))
+    assert ["v" + importlib.metadata.version("opencontext-core")] == pinned
+
+
 def test_core_pin_is_the_same_everywhere():
     pins = {
         name: PIN.findall((REPO_ROOT / name).read_text("utf-8"))

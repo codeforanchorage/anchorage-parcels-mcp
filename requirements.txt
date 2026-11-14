@@ -1,7 +1,7 @@
 # The MCP server core (core/ and server/): protocol handling, HTTP handler,
 # Lambda adapter, plugin interfaces. Shared by every OpenContext deployment;
 # upgrade by moving the tag. Keep in step with pyproject.toml.
-opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.3.1
+opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.4.0
 
 httpx>=0.27.0
 pydantic>=2.0.0
