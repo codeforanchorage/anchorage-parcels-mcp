@@ -36,10 +36,10 @@ jobs:
           pip install ruff==0.15.1
 
       - name: Ruff lint
-        run: ruff check core/ plugins/ server/ tests/
+        run: ruff check plugins/ tests/
 
       - name: Ruff format
-        run: ruff format --check core/ plugins/ server/ tests/
+        run: ruff format --check plugins/ tests/
 
       # config.yaml is gitignored, so CI validates the tracked source this
       # fork actually deploys from.
@@ -65,7 +65,7 @@ jobs:
       - name: Pytest
         run: |
           pytest tests/ -q \
-            --cov=core --cov=plugins --cov=server \
+            --cov=plugins \
             --cov-report=term-missing
 
   audit:

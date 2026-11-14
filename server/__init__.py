@@ -1,1 +1,0 @@
-"""Lambda server for OpenContext."""

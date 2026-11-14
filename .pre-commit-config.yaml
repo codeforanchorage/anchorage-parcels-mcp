@@ -16,7 +16,7 @@ repos:
       - id: check-merge-conflict
       - id: detect-private-key
 
-  # Python: Ruff lint (with auto-fix) and format (matches CI: core/ plugins/ server/ tests/)
+  # Python: Ruff lint (with auto-fix) and format (matches CI: plugins/ tests/)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1
     hooks:

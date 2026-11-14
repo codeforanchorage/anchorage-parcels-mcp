@@ -113,7 +113,7 @@ asyncio.run(t())
 pip install pytest pytest-asyncio sqlparse
 pytest
 pytest tests/test_plugin_manager.py -v
-pytest --cov=core --cov=plugins
+pytest --cov=plugins
 ```
 
 ---

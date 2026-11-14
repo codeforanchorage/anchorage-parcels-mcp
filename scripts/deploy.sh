@@ -251,11 +251,11 @@ PACKAGE_DIR=".deploy"
 rm -rf "$PACKAGE_DIR"
 mkdir -p "$PACKAGE_DIR"
 
-# Copy code to package directory
-cp -r core "$PACKAGE_DIR/"
+# Copy this deployment's code to the package directory. core/ and server/
+# are NOT copied: they come from the opencontext-core requirement, which the
+# install step below places next to plugins/ in the package root.
 cp -r plugins "$PACKAGE_DIR/"
 cp -r custom_plugins "$PACKAGE_DIR/" 2>/dev/null || mkdir -p "$PACKAGE_DIR/custom_plugins"
-cp -r server "$PACKAGE_DIR/"
 cp requirements.txt "$PACKAGE_DIR/" 2>/dev/null || true
 # Ship config.yaml INSIDE the package. The Lambda reads it at runtime
 # (server/http_handler.py::_packaged_config_path) instead of via the
@@ -279,7 +279,16 @@ if command -v uv &> /dev/null; then
     fi
 else
     echo "uv not found, falling back to pip..."
-    if ! pip install -r requirements.txt -t "$PACKAGE_DIR/" \
+    # opencontext-core cannot go through this install: it comes from a git
+    # tag, so pip has to BUILD it, and pip refuses to build anything while
+    # --platform/--python-version are set. It is pure Python, so it is
+    # installed in a second step with no platform flags and --no-deps;
+    # its own dependencies (pydantic, PyYAML, python-json-logger) are in
+    # requirements.txt and arrive, as Lambda-target wheels, with this step.
+    BINARY_REQS="$PACKAGE_DIR/.requirements-binary.txt"
+    CORE_REQ=$(grep -E '^opencontext-core[ @]' requirements.txt | tr -d '\r' || true)
+    grep -vE '^opencontext-core[ @]' requirements.txt > "$BINARY_REQS"
+    if ! pip install -r "$BINARY_REQS" -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
         --implementation cp \
         --python-version 3.11 \
@@ -289,7 +298,24 @@ else
         echo "Ensure pip >= 23.0 and that all packages have manylinux wheels."
         exit 1
     fi
+    rm -f "$BINARY_REQS"
+    if [ -n "$CORE_REQ" ]; then
+        if ! pip install "$CORE_REQ" -t "$PACKAGE_DIR/" \
+            --no-deps --no-compile; then
+            echo -e "${RED}Error: Failed to install opencontext-core${NC}"
+            exit 1
+        fi
+    fi
 fi
+
+# The handler string is server.adapters.aws_lambda.lambda_handler, so a
+# package without these files is a Lambda that cannot start.
+for required in core/mcp_server.py server/adapters/aws_lambda.py; do
+    if [ ! -f "$PACKAGE_DIR/$required" ]; then
+        echo -e "${RED}Error: $required is missing from the package. Is opencontext-core in requirements.txt?${NC}"
+        exit 1
+    fi
+done
 
 # Create zip file
 ZIP_FILE="lambda-deployment.zip"
