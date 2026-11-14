@@ -176,7 +176,10 @@ except Exception as e:
 try:
     r = call_tool("nope", {})
     err = r.get("error", {})
-    ok = err.get("code") == -32602 and "available_tools" in (err.get("data") or {})
+    # `data` is a string naming the tools: "Available tools: a, b, ..."
+    ok = err.get("code") == -32602 and "anchorage_parcels__find_parcel" in str(
+        err.get("data")
+    )
     check("error handling (unknown tool -> -32602)", ok, json.dumps(err)[:80])
 except Exception as e:
     check("error handling (unknown tool -> -32602)", False, repr(e))
