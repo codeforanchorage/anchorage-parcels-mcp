@@ -11,3 +11,8 @@ jsonschema>=4.0.0
 
 # Pre-commit hooks (run: pre-commit install)
 pre-commit>=4.0.0
+
+# Local MCP server (scripts/local_server.py). Dev-only: the Lambda
+# is invoked by API Gateway and never imports it, so it is kept out of
+# requirements.txt and therefore out of the deployment package.
+aiohttp>=3.8.0
