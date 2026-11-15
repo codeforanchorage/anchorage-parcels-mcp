@@ -25,8 +25,8 @@ python -c "from core.validators import load_and_validate_config; load_and_valida
 
 # Tests
 python -m pytest tests/ -q                                           # All tests
-python -m pytest tests/test_ckan_plugin.py -v                        # Single file
-python -m pytest tests/test_ckan_plugin.py::TestClass::test_name -v  # Single test
+python -m pytest tests/test_anchorage_gis_plugin.py -v                        # Single file
+python -m pytest tests/test_anchorage_gis_plugin.py::TestClass::test_name -v  # Single test
 python -m pytest tests/ --cov=plugins --cov-report=term-missing
 # No coverage threshold is configured -- the report is informational.
 

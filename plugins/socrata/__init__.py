@@ -1,1 +1,0 @@
-"""Socrata plugin for OpenContext."""

@@ -54,5 +54,4 @@ asyncio_default_fixture_loop_scope = "function"
 # Exclude hard-to-test modules from coverage (formatters, integration-heavy plugin code)
 omit = [
     "*/tests/*",
-    "*/plugins/ckan/plugin.py",
 ]

@@ -318,7 +318,7 @@ def __init__(self, config: Dict[str, Any]) -> None:
 ## Reference
 
 - [Plugin Template](../custom_plugins/template/plugin_template.py)
-- [CKAN Plugin](../plugins/ckan/plugin.py) - Example implementation
+- [CKAN Plugin](https://github.com/CityOfBoston/OpenContext/tree/main/plugins/ckan/plugin.py) - Example implementation
 - [Core Interfaces](../core/interfaces.py) - API reference
 
 ## Getting Help
