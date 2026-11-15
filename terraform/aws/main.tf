@@ -4,7 +4,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 5.0"
+      version = "~> 6.0"
     }
     archive = {
       source  = "hashicorp/archive"
@@ -75,7 +75,7 @@ resource "aws_lambda_function" "mcp_server" {
   role             = aws_iam_role.lambda_role.arn
   handler          = "server.adapters.aws_lambda.lambda_handler"
   source_code_hash = local.lambda_zip_hash
-  runtime          = "python3.11"
+  runtime          = "python3.14"
   memory_size      = local.lambda_memory
   timeout          = local.lambda_timeout
 

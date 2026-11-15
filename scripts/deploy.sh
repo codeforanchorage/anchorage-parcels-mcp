@@ -272,7 +272,7 @@ if command -v uv &> /dev/null; then
     if ! uv pip install -r requirements.txt \
         --target "$PACKAGE_DIR/" \
         --python-platform x86_64-manylinux2014 \
-        --python-version 3.11 \
+        --python-version 3.14 \
         --no-compile; then
         echo -e "${RED}❌ Error: Failed to install dependencies with uv${NC}"
         exit 1
@@ -291,7 +291,7 @@ else
     if ! pip install -r "$BINARY_REQS" -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
         --implementation cp \
-        --python-version 3.11 \
+        --python-version 3.14 \
         --only-binary :all: \
         --no-compile; then
         echo -e "${RED}❌ Error: Failed to install dependencies for Lambda target platform${NC}"

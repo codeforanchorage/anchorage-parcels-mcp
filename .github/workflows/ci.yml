@@ -22,7 +22,7 @@ jobs:
         with:
           # Matches the Lambda runtime. Testing on the version we deploy
           # is worth more than testing on the newest available.
-          python-version: "3.11"
+          python-version: "3.14"
           cache: pip
 
       - name: Install dependencies
@@ -75,7 +75,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.14"
           cache: pip
       - run: pip install pip-audit
       # Runtime dependencies only -- these are what ship in the Lambda zip.
