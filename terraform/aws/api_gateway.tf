@@ -214,9 +214,12 @@ resource "aws_api_gateway_method_settings" "mcp_post" {
   stage_name  = aws_api_gateway_stage.prod.stage_name
   method_path = "*/*"
 
+  # Same vars as the usage plan below. The usage plan only throttles keyed
+  # requests (the disabled /mcp-gcc route); THIS block is what limits the
+  # keyless public /mcp route, so it must not drift from the tfvars.
   settings {
-    throttling_burst_limit = 10
-    throttling_rate_limit  = 5
+    throttling_burst_limit = var.api_burst_limit
+    throttling_rate_limit  = var.api_rate_limit
   }
 }
 
