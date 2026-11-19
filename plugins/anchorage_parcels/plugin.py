@@ -52,6 +52,14 @@ logger = logging.getLogger(__name__)
 # is intentionally one-directional (parcels -> gis); anchorage_gis knows
 # nothing about this plugin.
 _normalize_parcel_variants = AnchorageGISPlugin._normalize_parcel_variants
+_parcel_base_and_sub = AnchorageGISPlugin._parcel_base_and_sub
+_parcel_digits = AnchorageGISPlugin._parcel_digits
+
+_PARCEL_ID_HELP = (
+    "Pass the parcel number on its own (5 to 11 digits, hyphens "
+    "optional). An address is not a parcel number: use "
+    "search_by_address for that."
+)
 
 # Layer-extent vs municipality-area coverage, shared with the GIS server so
 # the two report the same figure for the same layer (both wrap
@@ -170,6 +178,8 @@ CAVEAT_CODES = (
     "no_results",  # nothing matched
     "fuzzy_match",  # rows are LIKE candidates, NOT exact matches
     "no_fuzzy_candidates",  # not even a fuzzy fallback hit
+    "fuzzy_search_failed",  # the fallback search errored: NOT "no parcel"
+    "base_number_match",  # the sub-parcel asked for does not exist
     "multiple_records",  # the ID resolves to several records (condos)
     "address_point_fallback",  # resolved via address layer + point-in-polygon
     "no_address_match",  # neither situs nor address-point matched
@@ -1203,6 +1213,44 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
     # ── Tool: find_parcel ─────────────────────────────────────────────
 
+    FUZZY_CANDIDATES_SHOWN = 5
+    FUZZY_CANDIDATE_ROWS = 50
+
+    def _parcel_number_wheres(
+        self, parcel_id: str, variants: List[str]
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """The WHERE for a parcel-number lookup; then, for an 11-digit
+        number, the base-number WHERE to fall back to when it matches
+        nothing, and the note to attach if that fallback finds rows.
+
+        A base number ('002-151-32') means every record under it. An
+        11-digit number ('012-182-04-001') names ONE record, but the
+        lookup used to add the base number to the same IN list, so
+        asking for unit 001 of a condominium returned all 24 units as an
+        exact match, and get_parcel_details answered "which unit?" to a
+        caller who had just said which. Now the 11-digit number is
+        tried alone first; only when no record carries it does the base
+        number apply, and the result says so.
+        """
+        fields = self._parcel_id_fields
+
+        def where_for(values: List[str]) -> str:
+            in_list = ",".join(self._sql_quote(v) for v in values)
+            return "(" + " OR ".join(f"{f} IN ({in_list})" for f in fields) + ")"
+
+        digits = _parcel_digits(parcel_id)
+        if digits is None or len(digits) < 9:
+            return where_for(variants), None, None
+        base8, sub3 = _parcel_base_and_sub(parcel_id)
+        base_forms = [base8, f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}"]
+        exact_forms = [v for v in variants if v not in base_forms]
+        note = (
+            f"No record numbered `{base8}{sub3}` was found. What follows "
+            f"matched on the base number `{base_forms[1]}`, not the "
+            f"sub-parcel `{sub3}`: check it is the parcel meant."
+        )
+        return where_for(exact_forms), where_for(base_forms), note
+
     async def _find_parcel(self, args: Dict[str, Any]) -> _ToolOutput:
         parcel_id = str(args.get("parcel_id") or "").strip()
         if not parcel_id:
@@ -1216,13 +1264,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
             raise ToolInputError(
                 f"Could not extract a parcel number from {parcel_id!r}. "
                 f"Provide an ID like '002-151-32', '00215132', "
-                f"'00215132000', or '002-151-32-000'."
+                f"'00215132000', or '002-151-32-000'. {_PARCEL_ID_HELP}"
             )
-        in_list = ",".join(self._sql_quote(v) for v in variants)
-        exact_clause = " OR ".join(
-            f"{f} IN ({in_list})" for f in self._parcel_id_fields
+        number_where, base_where, fallback_note = self._parcel_number_wheres(
+            parcel_id, variants
         )
-        where = self._combine_where(f"({exact_clause})", category_clause)
+        where = self._combine_where(number_where, category_clause)
 
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
@@ -1236,10 +1283,23 @@ class AnchorageParcelsPlugin(MCPPlugin):
         }
 
         records, _ = await self._query_property_layer(where, out_fields, limit)
+        base_note = None
+        if not records and base_where:
+            where = self._combine_where(base_where, category_clause)
+            records, _ = await self._query_property_layer(where, out_fields, limit)
+            if records:
+                base_note = fallback_note
+                query["where"] = where
         if records:
+            caveats.add_first("base_number_match", base_note)
+            how = (
+                "matched on the base number, not the sub-parcel"
+                if base_note
+                else "exact match"
+            )
             heading = (
                 f"## Parcel lookup: `{parcel_id}` -> "
-                f"{len(records)} record(s) (exact match)\n"
+                f"{len(records)} record(s) ({how})\n"
                 f"Variants tried ({len(variants)}): "
                 + ", ".join(f"`{v}`" for v in variants)
                 + "\n"
@@ -1256,30 +1316,61 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 text,
                 self._envelope(
                     query,
-                    {"returned_count": len(records), "exact_match": True},
+                    {
+                        "returned_count": len(records),
+                        "exact_match": base_note is None,
+                    },
                     caveats,
                     rows=records,
                 ),
             )
 
-        # Zero exact hits -> LIKE fallback on the 11-digit column with a
-        # distinctive digit substring, clearly labeled as fuzzy.
-        digits = "".join(c for c in parcel_id if c.isdigit())
-        stripped = digits.lstrip("0")
-        substring = stripped[:6] if len(stripped) >= 6 else stripped
+        # Zero exact hits -> near misses, clearly labelled as fuzzy.
+        #
+        # The search is for the 8-digit BASE the lookup itself used, in
+        # compact and hyphenated form. It used to take the first six
+        # digits of whatever was typed, text and all; fetch five rows in
+        # no order, so one condo complex could fill the list; and treat
+        # a failed search as "no candidates", which reads as "no such
+        # parcel".
+        id_field = self._f("parcel_id")
+        base8 = (_parcel_base_and_sub(parcel_id) or ("",))[0]
+        compact = base8.lstrip("0")
+        hyphenated = f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}".lstrip("0-")
         candidates: List[Dict[str, Any]] = []
-        if substring:
+        more_candidates = False
+        search_failed = ""
+        # Three digits match thousands of parcels: no shortlist drawn
+        # from them means anything.
+        if len(compact) >= 4:
             like_where = self._combine_where(
-                f"{self._f('parcel_id')} LIKE "
-                f"'%{substring.replace(chr(39), chr(39) * 2)}%'",
+                f"({id_field} LIKE '%{compact}%' OR {id_field} LIKE '%{hyphenated}%')",
                 category_clause,
             )
             try:
-                candidates, _ = await self._query_property_layer(
-                    like_where, self._summary_fields, 5
+                found, exceeded = await self._query_property_layer(
+                    like_where,
+                    self._summary_fields,
+                    self.FUZZY_CANDIDATE_ROWS,
+                    order_by=id_field,
                 )
-            except Exception:
-                candidates = []
+            except Exception as e:
+                logger.warning("find_parcel fuzzy search failed: %s", type(e).__name__)
+                search_failed = str(e) or type(e).__name__
+            else:
+                seen: set = set()
+                for row in found:
+                    key = row.get(id_field)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    candidates.append(row)
+                more_candidates = (
+                    len(candidates) > self.FUZZY_CANDIDATES_SHOWN
+                    or len(found) >= self.FUZZY_CANDIDATE_ROWS
+                    or exceeded
+                )
+                candidates = candidates[: self.FUZZY_CANDIDATES_SHOWN]
 
         lines = [
             f"## Parcel lookup: no exact match for `{parcel_id}`",
@@ -1290,9 +1381,23 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if candidates:
             caveats.add(
                 "fuzzy_match",
-                f"**FUZZY candidates** (LIKE '%{substring}%' on "
-                f"{self._f('parcel_id')} -- these are NOT exact matches, "
+                f"**FUZZY candidates** (LIKE '%{compact}%' on "
+                f"{id_field} -- these are NOT exact matches, "
                 f"verify before using):",
+            )
+            if more_candidates:
+                caveats.add(
+                    "list_truncated",
+                    f"Only the first {len(candidates)} fuzzy candidates "
+                    "are listed; other parcel numbers containing these "
+                    "digits may exist.",
+                )
+        elif search_failed:
+            caveats.add(
+                "fuzzy_search_failed",
+                "The search for near matches could not be completed "
+                f"({search_failed}). That is NOT evidence the parcel is "
+                "absent: try again, or retry with category='All'.",
             )
         else:
             caveats.add(
@@ -1336,13 +1441,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if not variants:
             raise ToolInputError(
                 f"Could not extract a parcel number from {parcel_id!r}. "
-                f"Provide an ID like '002-151-32' or '00215132000'."
+                f"Provide an ID like '002-151-32' or '00215132000'. "
+                f"{_PARCEL_ID_HELP}"
             )
-        in_list = ",".join(self._sql_quote(v) for v in variants)
-        where = (
-            "("
-            + " OR ".join(f"{f} IN ({in_list})" for f in self._parcel_id_fields)
-            + ")"
+        where, base_where, fallback_note = self._parcel_number_wheres(
+            parcel_id, variants
         )
 
         caveats = _Caveats()
@@ -1353,6 +1456,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
         }
 
         records, _ = await self._query_property_layer(where, "*", 2)
+        base_note = None
+        if not records and base_where:
+            records, _ = await self._query_property_layer(base_where, "*", 2)
+            if records:
+                where, base_note = base_where, fallback_note
+                query["where"] = where
         if not records:
             # Zero-result branch: it MUST still emit conforming
             # structured content, not short-circuit past it.
@@ -1377,6 +1486,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     candidates=[],
                 ),
             )
+        # Set only when rows came back for the base number instead of
+        # the sub-parcel asked for; a miss above needs no such note.
+        caveats.add("base_number_match", base_note)
         if len(records) > 1:
             # Condos share a parcel root; Parcel_ID_Count > 1 marks it.
             # Refetch slim columns so every unit is listed -- large
@@ -1475,6 +1587,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             pass
 
         lines = self._provenance(where=where, out_fields="*", limit=1)
+        if len(caveats):
+            lines.append("")
+            self._render_caveats(lines, caveats)
         lines += [
             "",
             f"# Parcel {v('parcel_id')} -- {v('situs_address') or 'no situs address'}",
@@ -2281,8 +2396,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "exact_match": {
                     "type": "boolean",
                     "description": (
-                        "False when `rows` are fuzzy LIKE candidates "
-                        "rather than exact hits -- verify before using."
+                        "False when `rows` are fuzzy LIKE candidates, "
+                        "or matched only on the base number of a "
+                        "sub-parcel that does not exist (see the "
+                        "caveats) -- verify before using."
                     ),
                 },
             },

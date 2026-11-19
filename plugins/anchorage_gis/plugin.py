@@ -775,6 +775,71 @@ class AnchorageGISPlugin(DataPlugin):
                     return (field, v)
         return None
 
+    # A token with the complete shape of a parcel number: the only kind
+    # picked out of surrounding text.
+    _PARCEL_STRICT_RE = re.compile(
+        r"[0-9]{3}-[0-9]{3}-[0-9]{2}(?:-[0-9]{3})?|[0-9]{8}|[0-9]{11}"
+    )
+    _PARCEL_TOKEN_RE = re.compile(
+        r"(?<![0-9A-Za-z-])[0-9]+(?:-[0-9]+)*(?![0-9A-Za-z-])"
+    )
+    _PARCEL_ALONE_RE = re.compile(r"[0-9][0-9 \t.\-]*")
+
+    @classmethod
+    def _parcel_base_and_sub(cls, raw: Any) -> Optional[Tuple[str, str]]:
+        """(8-digit base, 3-digit sub) read from a caller's parcel id.
+
+        The sub is "000" when the caller gave only a base number; use
+        ``_parcel_digits`` to tell that from a sub-parcel they named.
+        """
+        digits = cls._parcel_digits(raw)
+        if digits is None:
+            return None
+        if len(digits) >= 9:
+            # 9-11 digits: the 11-digit form, leading zeros dropped.
+            padded = digits.rjust(11, "0")
+            return padded[:8], padded[8:]
+        # 5-8 digits: the 8-digit base, no sub-parcel.
+        return digits.rjust(8, "0"), "000"
+
+    @classmethod
+    def _parcel_digits(cls, raw: Any) -> Optional[str]:
+        """The 5 to 11 digits of a caller's parcel id, or None.
+
+        Every digit in the input used to be run together, so "Lot 5
+        Block 12, 003-184-87" became 51200318487 and an address with a
+        ZIP code became a parcel number: a lookup of a DIFFERENT parcel,
+        answered as if it were the one asked for. Now:
+
+        - an id on its own (digits with hyphens, spaces or dots) is
+          read whole, leading zeros optional;
+        - in free text, only a token with the full shape of a parcel
+          number counts (XXX-XXX-XX, XXX-XXX-XX-XXX, 8 or 11 digits),
+          and there must be exactly one;
+        - more than 11 digits is not a parcel number (the extra ones
+          used to be dropped silently).
+
+        Same rules as the Anchorage GIS server (anchorage-gis-mcp
+        3e2ce1f).
+        """
+        if raw is None:
+            return None
+        text = str(raw).strip()
+        if cls._PARCEL_ALONE_RE.fullmatch(text):
+            digits = re.sub(r"[^0-9]", "", text)
+        else:
+            strict = [
+                t
+                for t in cls._PARCEL_TOKEN_RE.findall(text)
+                if cls._PARCEL_STRICT_RE.fullmatch(t)
+            ]
+            if len(set(strict)) != 1:
+                return None
+            digits = strict[0].replace("-", "")
+        if len(digits) < 5 or len(digits) > 11:
+            return None
+        return digits
+
     @staticmethod
     def _normalize_parcel_variants(raw: Any) -> List[str]:
         """Generate MOA parcel ID format variants for cross-dataset
@@ -795,33 +860,16 @@ class AnchorageGISPlugin(DataPlugin):
         rarely knows which form a given layer uses, so we generate
         all four for use in ``WHERE field IN (...)``.
 
-        Input handling: extracts digits from the input, pads/splits
-        based on length to recover the 8-digit base + 3-digit sub.
-        Hyphens, leading zeros, and prefixes/suffixes are flexible.
+        Input handling: the ID may be written with hyphens, spaces or
+        dots and with leading zeros dropped. Free text around it is
+        accepted only when exactly one token in it has the full shape
+        of a parcel number (see ``_parcel_base_and_sub``); returns []
+        when no single ID can be read.
         """
-        if raw is None:
+        parts = AnchorageGISPlugin._parcel_base_and_sub(raw)
+        if parts is None:
             return []
-        digits = "".join(c for c in str(raw) if c.isdigit())
-        if not digits or len(digits) < 5:
-            return []
-
-        if len(digits) >= 11:
-            # Take the LAST 11 digits -- accommodates inputs like
-            # "Parcel 00318487000" if any non-digit prefixes slipped
-            # through.
-            tail = digits[-11:]
-            base8 = tail[:8]
-            sub3 = tail[8:11]
-        elif len(digits) >= 9:
-            # 9 or 10 digits -- pad on the left to 11, then split.
-            padded = digits.rjust(11, "0")
-            base8 = padded[:8]
-            sub3 = padded[8:11]
-        else:
-            # 5-8 digits -- pad on the left to 8, default to no
-            # sub-parcel.
-            base8 = digits.rjust(8, "0")
-            sub3 = "000"
+        base8, sub3 = parts
 
         variants: set = set()
         variants.add(base8)

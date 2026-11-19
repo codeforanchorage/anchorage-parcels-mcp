@@ -280,7 +280,9 @@ def main() -> int:
         )
         check(
             "unknown tool: data lists the available tools",
-            bool((err.get("data") or {}).get("available_tools")),
+            # opencontext-core 1.4 sends `data` as a sentence; older
+            # servers sent {"available_tools": [...]}.
+            "anchorage_parcels__find_parcel" in json.dumps(err.get("data")),
         )
 
         data = rpc(client, url, "no/such/method").json()

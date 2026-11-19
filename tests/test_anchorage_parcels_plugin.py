@@ -399,9 +399,15 @@ class TestFindParcel:
             "GIS_ParcelNum11Formatted",
         ):
             assert f"{field} IN (" in where
-        # All four canonical variants inside the IN lists.
-        for v in self.ALL_VARIANTS:
+        # A base number is looked up in all four forms. An 11-digit
+        # number names one record, so only its own two forms are tried
+        # first (the base forms are the fallback, tested below).
+        eleven = {"00215132000", "002-151-32-000"}
+        expected = eleven if raw in eleven else self.ALL_VARIANTS
+        for v in expected:
             assert f"'{v}'" in where
+        for v in self.ALL_VARIANTS - expected:
+            assert f"'{v}'" not in where
         # Default category filter applies.
         assert "GIS_Category = 'Parcel'" in where
         assert params["returnGeometry"] == "false"
@@ -482,6 +488,259 @@ class TestFindParcel:
         text = tool_text(result)
         assert "no exact match" in text
         assert "category='All'" in text
+
+    # -- an 11-digit number names ONE record --
+
+    CONDO = [
+        dict(Parcel_ID=f"012182040{i:02d}", Parcel_Address="7332 HUNTSMEN CIR")
+        for i in range(1, 4)
+    ]
+
+    @staticmethod
+    def _by_number(rows):
+        """Serve `rows` the way the layer would for an IN lookup."""
+
+        def route(url, params):
+            return is_feature_query(url, params) and "LIKE" not in params["where"]
+
+        def payload_for(where):
+            hits = [
+                r
+                for r in rows
+                if f"'{r['Parcel_ID']}'" in where or f"'{r['Parcel_ID'][:8]}'" in where
+            ]
+            return {"features": [feat(**r) for r in hits]}
+
+        return route, payload_for
+
+    def _install_condo(self, plugin):
+        calls = []
+
+        async def fake_get(url, params=None):
+            params = dict(params or {})
+            calls.append((url, params))
+            where = params.get("where", "")
+            if params.get("returnCountOnly") == "true":
+                n = len(self._by_number(self.CONDO)[1](where)["features"])
+                return make_response({"count": n})
+            if "LIKE" in where:
+                return make_response({"features": []})
+            return make_response(self._by_number(self.CONDO)[1](where))
+
+        client = Mock()
+        client.get = AsyncMock(side_effect=fake_get)
+        client.aclose = AsyncMock()
+        plugin.client = client
+        return calls
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("raw", ["012-182-04-002", "01218204002"])
+    async def test_unit_number_returns_that_unit_only(self, plugin, raw):
+        self._install_condo(plugin)
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": raw})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert [r["Parcel_ID"] for r in structured["rows"]] == ["01218204002"]
+        assert structured["summary"]["exact_match"] is True
+        assert "exact match" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_base_number_still_returns_every_unit(self, plugin):
+        calls = self._install_condo(plugin)
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "012-182-04"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert len(structured["rows"]) == 3
+        assert structured["summary"]["exact_match"] is True
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_missing_sub_parcel_matches_on_the_base_and_says_so(self, plugin):
+        self._install_condo(plugin)
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "012-182-04-999"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert len(structured["rows"]) == 3
+        assert structured["summary"]["exact_match"] is False
+        first = structured["caveats"][0]
+        assert first["code"] == "base_number_match"
+        assert "not the sub-parcel `999`" in first["message"]
+        text = tool_text(result)
+        assert "matched on the base number, not the sub-parcel" in text
+        assert "exact match" not in text
+        assert "'01218204999'" not in structured["query"]["where"]
+
+    @pytest.mark.asyncio
+    async def test_details_resolves_a_unit_number(self, plugin):
+        """It used to answer "which unit?" to a caller who had said."""
+        self._install_condo(plugin)
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "012-182-04-002"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is True
+        assert structured["summary"]["match_count"] == 1
+        assert "Parcel 01218204002" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_details_for_missing_sub_parcel_lists_the_base(self, plugin):
+        self._install_condo(plugin)
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "012-182-04-999"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is False
+        codes = [c["code"] for c in structured["caveats"]]
+        assert codes[:2] == ["base_number_match", "multiple_records"]
+        assert "No record numbered `01218204999`" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_details_single_base_record_carries_the_note(self, plugin):
+        # 002-151-32-999: no such sub-parcel, one record under the base.
+        def route(url, params):
+            return is_feature_query(url, params) and "'00215132'" in params["where"]
+
+        install_client(
+            plugin,
+            routes=[(route, {"features": [feat(**SAMPLE_RECORD)]})],
+            default={"features": []},
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "002-151-32-999"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is True
+        assert [c["code"] for c in structured["caveats"]] == ["base_number_match"]
+        assert "not the sub-parcel `999`" in tool_text(result)
+
+    # -- digits from around the id must not be run into it --
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "Lot 5 Block 12, 002-151-32",
+            "002-151-32 (Lot 5, Block 12)",
+            "PID: 00215132",
+            "parcel #002-151-32-000.",
+        ],
+    )
+    def test_surrounding_text_does_not_change_the_id(self, raw):
+        assert self.ALL_VARIANTS <= set(_normalize_parcel_variants(raw))
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "144 W 15th Ave 99501",  # an address is not a parcel number
+            "144 W 15th Ave, Anchorage, AK 99501-1234",
+            "002-151-32 or 003-184-87",  # two ids: which one?
+            "Lot 5 Block 12",
+            "0021513200099",  # 13 digits
+            "A00215132",  # part of a longer identifier
+        ],
+    )
+    def test_unreadable_input_is_refused(self, raw):
+        assert _normalize_parcel_variants(raw) == []
+
+    @pytest.mark.parametrize(
+        "raw", ["002 151 32", "002.151.32", "215132000", "2-151-32"]
+    )
+    def test_id_alone_in_any_spelling(self, raw):
+        assert self.ALL_VARIANTS <= set(_normalize_parcel_variants(raw))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("tool", ["find_parcel", "get_parcel_details"])
+    async def test_address_is_refused_before_any_request(self, plugin, tool):
+        calls = install_client(plugin)
+        result = await run_tool(plugin, tool, {"parcel_id": "144 W 15th Ave 99501"})
+        assert result.success is False
+        assert "search_by_address" in result.error_message
+        assert not [c for c in calls if "/query" in c[0]]
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_search_uses_the_parcel_base(self, plugin):
+        # A sub-parcel that does not exist: the near misses share the
+        # 8-digit base, and text around the id plays no part.
+        calls = install_client(plugin, default={"features": []})
+        await run_tool(plugin, "find_parcel", {"parcel_id": "Parcel 002-151-32-999"})
+        where = calls[-1][1]["where"]
+        assert "Parcel_ID LIKE '%215132%'" in where
+        assert "LIKE '%2-151-32%'" in where
+        assert "999" not in where
+        assert calls[-1][1]["orderByFields"] == "Parcel_ID"
+
+    @pytest.mark.asyncio
+    async def test_fuzzy_candidates_are_listed_once_each(self, plugin):
+        unit = feat(
+            Parcel_ID="00215132001",
+            Parcel_Address="144 W 15TH AVE",
+            Owner_Name="A",
+        )
+        other = feat(
+            Parcel_ID="00215132002",
+            Parcel_Address="146 W 15TH AVE",
+            Owner_Name="B",
+        )
+        install_client(
+            plugin,
+            routes=[
+                (
+                    lambda u, p: "LIKE" in p.get("where", ""),
+                    {"features": [unit] * 7 + [other]},
+                )
+            ],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert [r["Parcel_ID"] for r in structured["rows"]] == [
+            "00215132001",
+            "00215132002",
+        ]
+        codes = [c["code"] for c in structured["caveats"]]
+        assert "fuzzy_match" in codes and "list_truncated" not in codes
+
+    @pytest.mark.asyncio
+    async def test_more_than_five_fuzzy_candidates_says_so(self, plugin):
+        rows = [
+            feat(Parcel_ID=f"0021513200{i}", Parcel_Address="X", Owner_Name="Y")
+            for i in range(8)
+        ]
+        install_client(
+            plugin,
+            routes=[(lambda u, p: "LIKE" in p.get("where", ""), {"features": rows})],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert len(structured["rows"]) == 5
+        assert any(c["code"] == "list_truncated" for c in structured["caveats"])
+
+    @pytest.mark.asyncio
+    async def test_failed_fuzzy_search_is_not_reported_as_absence(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    lambda u, p: "LIKE" in p.get("where", ""),
+                    {"error": {"code": 400, "message": "Invalid query"}},
+                )
+            ],
+            default={"features": []},
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        codes = [c["code"] for c in structured["caveats"]]
+        assert "fuzzy_search_failed" in codes
+        assert "no_fuzzy_candidates" not in codes
+        text = tool_text(result)
+        assert "NOT evidence the parcel is absent" in text
+        assert "may not exist" not in text
+
+    @pytest.mark.asyncio
+    async def test_too_few_digits_skips_the_fuzzy_search(self, plugin):
+        # 00000123 leaves "123", which matches thousands of parcels.
+        calls = install_client(plugin, default={"features": []})
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "00123"})
+        assert not [c for c in calls if "LIKE" in c[1].get("where", "")]
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert any(c["code"] == "no_fuzzy_candidates" for c in structured["caveats"])
 
 
 # ── get_parcel_details ─────────────────────────────────────────────────
