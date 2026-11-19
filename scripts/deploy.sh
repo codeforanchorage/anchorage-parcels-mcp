@@ -21,15 +21,18 @@ cd "$PROJECT_ROOT"
 # Parse named arguments
 ENVIRONMENT=""
 TF_WORKSPACE=""
+ALLOW_DIRTY=0
 AUTO_APPROVE="false"
 
 show_usage() {
-    echo "Usage: $0 --environment <staging|prod> [--tfworkspace <name>] [--yes]"
+    echo "Usage: $0 --environment <staging|prod> [--tfworkspace <name>] [--yes] [--allow-dirty]"
     echo ""
     echo "Options:"
     echo "  --environment, -e   Deployment environment: staging or prod (required)"
     echo "  --tfworkspace, -w   Terraform workspace name (default: anchorage-parcels-staging or anchorage-parcels-prod)"
     echo "  --yes, -y           Skip the interactive apply confirmation (non-interactive runs)"
+    echo "  --allow-dirty       Package the working tree even with uncommitted changes"
+    echo "                      (emergencies only; the build is stamped as dirty)"
     echo "  --help, -h          Show this help message"
 }
 
@@ -45,6 +48,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --yes|-y)
             AUTO_APPROVE="true"
+            shift
+            ;;
+        --allow-dirty)
+            ALLOW_DIRTY=1
             shift
             ;;
         --help|-h)
@@ -111,6 +118,24 @@ if ! command -v terraform &> /dev/null; then
     echo -e "${RED}❌ Error: terraform not found${NC}"
     echo "Please install Terraform: https://www.terraform.io/downloads"
     exit 1
+fi
+
+# The package is built from the files on disk, so what is on disk must be
+# a commit: otherwise an uncommitted edit (possibly another session's,
+# half finished) goes to AWS and the live code matches nothing in git.
+# Untracked files count; ignored files do not.
+GIT_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "unknown")
+GIT_DIRTY=$(git status --porcelain 2>/dev/null || true)
+if [ -n "$GIT_DIRTY" ]; then
+    if [ "$ALLOW_DIRTY" -ne 1 ]; then
+        echo -e "${RED}❌ Error: the working tree has uncommitted changes:${NC}"
+        echo "$GIT_DIRTY" | head -20
+        echo ""
+        echo "Commit or stash them, then deploy. To package the tree as it is"
+        echo "(emergencies only), re-run with --allow-dirty."
+        exit 1
+    fi
+    echo -e "${YELLOW}⚠️  --allow-dirty: packaging uncommitted changes${NC}"
 fi
 
 echo -e "${YELLOW}📋 Step 1: Validating configuration...${NC}"
@@ -266,10 +291,31 @@ cp config.yaml "$PACKAGE_DIR/"
 # Install Python dependencies into package directory
 echo "Installing Python dependencies..."
 
-# Prefer uv for faster, cached installs; fall back to pip if uv is unavailable
+# With uv, install the exact versions in uv.lock -- the ones CI ran the
+# tests against. requirements.txt only gives lower bounds (httpx>=0.27.0),
+# so installing from it resolved afresh on every deploy and shipped
+# library versions that nothing had tested. To take newer versions, run
+# `uv lock --upgrade`, run the tests, commit uv.lock, then deploy.
+# uv may be on PATH or only installed as a Python module.
+UV=""
 if command -v uv &> /dev/null; then
-    echo "Using uv to install dependencies..."
-    if ! uv pip install -r requirements.txt \
+    UV="uv"
+elif "$PYTHON" -m uv --version &> /dev/null; then
+    UV="$PYTHON -m uv"
+fi
+
+if [ -n "$UV" ]; then
+    echo "Using uv to install the locked dependencies..."
+    LOCKED_REQS="$PACKAGE_DIR/.requirements-locked.txt"
+    # --locked fails if uv.lock is out of date with pyproject.toml.
+    if ! $UV export --locked --no-dev --no-emit-project --no-hashes \
+        --output-file "$LOCKED_REQS" > /dev/null; then
+        echo -e "${RED}❌ Error: uv.lock is missing or out of date with pyproject.toml${NC}"
+        echo "Run 'uv lock', run the tests, commit uv.lock, then deploy."
+        exit 1
+    fi
+    if ! $UV pip install -r "$LOCKED_REQS" \
+        --no-deps \
         --target "$PACKAGE_DIR/" \
         --python-platform x86_64-manylinux2014 \
         --python-version 3.14 \
@@ -277,8 +323,10 @@ if command -v uv &> /dev/null; then
         echo -e "${RED}❌ Error: Failed to install dependencies with uv${NC}"
         exit 1
     fi
+    rm -f "$LOCKED_REQS"
 else
-    echo "uv not found, falling back to pip..."
+    echo -e "${YELLOW}⚠️  uv not found: falling back to pip and requirements.txt.${NC}"
+    echo -e "${YELLOW}   Versions are NOT taken from uv.lock and may differ from CI.${NC}"
     # opencontext-core cannot go through this install: it comes from a git
     # tag, so pip has to BUILD it, and pip refuses to build anything while
     # --platform/--python-version are set. It is pure Python, so it is
@@ -316,6 +364,17 @@ for required in core/mcp_server.py server/adapters/aws_lambda.py; do
         exit 1
     fi
 done
+
+# Record what this package was built from, so "what is live?" can be
+# answered from the zip: the commit, whether the tree was dirty, and
+# whether the versions came from uv.lock.
+BUILD_LOCKED=false
+[ -n "$UV" ] && BUILD_LOCKED=true
+BUILD_DIRTY=false
+[ -n "$GIT_DIRTY" ] && BUILD_DIRTY=true
+printf '{"commit": "%s", "dirty": %s, "locked": %s}\n' \
+    "$GIT_COMMIT" "$BUILD_DIRTY" "$BUILD_LOCKED" > "$PACKAGE_DIR/BUILD_INFO.json"
+echo "Build: commit ${GIT_COMMIT:0:7} dirty=${BUILD_DIRTY} locked=${BUILD_LOCKED}"
 
 # Create zip file
 ZIP_FILE="lambda-deployment.zip"
