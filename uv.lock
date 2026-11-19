@@ -841,7 +841,7 @@ requires-dist = [
     { name = "aiohttp", marker = "extra == 'dev'", specifier = ">=3.8.0" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "jsonschema", marker = "extra == 'dev'", specifier = ">=4.0.0" },
-    { name = "opencontext-core", git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.0" },
+    { name = "opencontext-core", git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.1" },
     { name = "pip-audit", marker = "extra == 'dev'", specifier = ">=2.0.0" },
     { name = "pydantic", specifier = ">=2.0.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0.0" },
@@ -856,8 +856,8 @@ provides-extras = ["dev"]
 
 [[package]]
 name = "opencontext-core"
-version = "1.4.0"
-source = { git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.0#7e1ce20d22bcaed624612e0dc9e0f466a2b684d0" }
+version = "1.4.1"
+source = { git = "https://github.com/codeforanchorage/opencontext-core?rev=v1.4.1#9ee59d0958596f4aff4e6217cbb864ed8b48b86d" }
 dependencies = [
     { name = "pydantic" },
     { name = "python-json-logger" },
