@@ -99,7 +99,9 @@ local-server convention).
 non-adjustable **29s** integration timeout > `aws.lambda_timeout` **28s** > the
 enabled plugin's own HTTP `timeout` **20s**. A plugin timeout above the Lambda's
 means a hung upstream kills the Lambda mid-flight instead of returning a
-readable tool error.
+readable tool error. In `anchorage_parcels` that 20s is the budget for the WHOLE
+tool call — every query and retry shares it (`_DEADLINE` in the plugin) — not a
+fresh allowance per request, or three retries would outlast the Lambda.
 
 **Config precedence is easy to get wrong and fails silently:**
 `aws.lambda_timeout` and `aws.lambda_memory` in `config.yaml` OVERRIDE

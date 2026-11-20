@@ -18,10 +18,12 @@ names via the ``field_map`` config key -- no other code changes.
 """
 
 import asyncio
+import contextvars
 import difflib
 import json
 import logging
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -44,6 +46,13 @@ from plugins.arcgis.where_validator import (
 )
 
 logger = logging.getLogger(__name__)
+
+# When the tool call in progress must stop waiting on ArcGIS, as a
+# time.monotonic() value; None outside a tool call. A context variable so
+# the queries a tool runs concurrently all share the one deadline.
+_DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
+    "anchorage_parcels_deadline", default=None
+)
 
 # Parcel-ID normalization is shared with the Anchorage GIS plugin
 # (plugins/anchorage_gis/plugin.py). It turns any of the four MOA parcel
@@ -550,6 +559,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
     def _sql_quote(value: str) -> str:
         return "'" + str(value).replace("'", "''") + "'"
 
+    @staticmethod
+    def _like(expr: str, text: str, prefix: str = "%", suffix: str = "%") -> str:
+        """`expr LIKE '<prefix>text<suffix>'` with `text` matched LITERALLY.
+
+        `%` and `_` typed by a caller are data, not wildcards: an owner
+        search for '_' used to match every record, and '100%' matched
+        '100TH AVENUE'. They are escaped, and the ESCAPE clause is only
+        added when there was something to escape.
+        """
+        quoted = str(text).replace("'", "''")
+        if not any(ch in quoted for ch in "%_\\"):
+            return f"{expr} LIKE '{prefix}{quoted}{suffix}'"
+        escaped = quoted.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return f"{expr} LIKE '{prefix}{escaped}{suffix}' ESCAPE '\\'"
+
     def _assessed_clause(self, include_unassessed: Any) -> Optional[str]:
         """Exclude geometry-only shell records unless asked not to.
 
@@ -710,7 +734,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         raw_limit = args.get("limit", default)
         try:
             requested = int(raw_limit)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
+            # OverflowError: JSON `1e999` / `Infinity` parse to float inf.
             raise ToolInputError(
                 f"limit must be an integer (got {raw_limit!r})."
             ) from None
@@ -782,14 +807,34 @@ class AnchorageParcelsPlugin(MCPPlugin):
         errors, HTTP 5xx, and transient ArcGIS error bodies; raises
         immediately (with a rewritten, actionable message) on real
         errors.
+
+        Inside a tool call every attempt draws on ONE time budget (see
+        `execute_tool`). The retries used to get a full HTTP timeout
+        each -- three times 20s against a 28s Lambda -- so a hung
+        upstream had the Lambda killed mid-retry and the caller handed
+        an opaque gateway error instead of a tool error it could read.
         """
         last_desc = "unknown error"
         attempt = 0
+        deadline = _DEADLINE.get()
+        out_of_time = False
         while attempt < self.ARCGIS_MAX_ATTEMPTS:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                out_of_time = True
+                break
             attempt += 1
             transient = False
             try:
-                resp = await self.client.get(url, params=params)
+                request = self.client.get(url, params=params)
+                if remaining is None:
+                    resp = await request
+                else:
+                    resp = await asyncio.wait_for(request, timeout=remaining)
+            except asyncio.TimeoutError:
+                out_of_time = True
+                last_desc = "no response before the time budget ran out"
+                break
             except (httpx.TransportError, httpx.TimeoutException) as e:
                 transient, last_desc = True, f"network error: {e!r}"
             else:
@@ -825,7 +870,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
                         )
             if not transient or attempt >= self.ARCGIS_MAX_ATTEMPTS:
                 break
-            await asyncio.sleep(self.ARCGIS_RETRY_BACKOFF_S * attempt)
+            backoff = self.ARCGIS_RETRY_BACKOFF_S * attempt
+            if deadline is not None and time.monotonic() + backoff >= deadline:
+                out_of_time = True
+                break
+            await asyncio.sleep(backoff)
+        if out_of_time:
+            raise RuntimeError(
+                f"The Feature Service did not answer within the "
+                f"{self.plugin_config.timeout}s this server allows for one "
+                f"tool call (after {attempt} attempt(s); last: {last_desc}). "
+                f"The upstream is slow or unreachable -- this is NOT 'no "
+                f"results'. Retry shortly."
+            )
         raise RuntimeError(
             f"Feature Service request failed after {attempt} attempt(s): {last_desc}"
         )
@@ -995,7 +1052,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             return ms
         try:
             dt = datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
-        except (ValueError, TypeError, OSError):
+        except (ValueError, TypeError, OSError, OverflowError):
             return ms
         if dt.hour == dt.minute == dt.second == dt.microsecond == 0:
             return dt.strftime("%Y-%m-%d")
@@ -1836,19 +1893,20 @@ class AnchorageParcelsPlugin(MCPPlugin):
             raise ToolInputError(
                 f"match must be one of {list(self.OWNER_MATCH_MODES)} (got {match!r})."
             )
-        needle = name.upper().replace("'", "''")
+        needle = name.upper()
+        upper_owner = f"UPPER({owner_field})"
         if match == "starts_with":
-            owner_clause = f"UPPER({owner_field}) LIKE '{needle}%'"
+            owner_clause = self._like(upper_owner, needle, prefix="")
         elif match == "surname":
             # Names are stored surname-first, so the surname is the text
             # before the first space -- or the whole value when it is the
             # only token.
             owner_clause = (
-                f"(UPPER({owner_field}) LIKE '{needle} %' "
-                f"OR UPPER({owner_field}) = '{needle}')"
+                f"({self._like(upper_owner, needle + ' ', prefix='')} "
+                f"OR {upper_owner} = {self._sql_quote(needle)})"
             )
         else:
-            owner_clause = f"UPPER({owner_field}) LIKE '%{needle}%'"
+            owner_clause = self._like(upper_owner, needle)
         where = self._combine_where(
             owner_clause,
             category_clause,
@@ -1915,11 +1973,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if not address:
             raise ToolInputError("address is required")
         limit, clamp_note = self._clamp_limit(args, default=10, maximum=100)
-        needle = address.upper().replace("'", "''")
+        needle = address.upper()
         situs_field = self._f("situs_address")
         include_unassessed = bool(args.get("include_unassessed", False))
         assessed_clause = self._assessed_clause(include_unassessed)
-        where = self._combine_where(f"{situs_field} LIKE '%{needle}%'", assessed_clause)
+        where = self._combine_where(self._like(situs_field, needle), assessed_clause)
 
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
@@ -1980,7 +2038,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # Fallback: resolve via the address-point layer, then
         # point-in-polygon against the property layer.
         addr_field = self._f("address_full")
-        addr_where = f"{addr_field} LIKE '%{needle}%'"
+        addr_where = self._like(addr_field, needle)
         addr_data = await self._layer_query(
             f"{self.plugin_config.addresses_layer_url}/query",
             {
@@ -2112,7 +2170,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         try:
             lat = float(args["lat"])
             lon = float(args["lon"])
-        except (KeyError, TypeError, ValueError):
+        except (KeyError, TypeError, ValueError, OverflowError):
             raise ToolInputError(
                 "lat and lon are required numbers (WGS84 decimal degrees, "
                 "e.g. lat=61.209, lon=-149.894)"
@@ -2206,7 +2264,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         raw_offset = args.get("offset", 0)
         try:
             offset = max(0, int(raw_offset))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ToolInputError(
                 f"offset must be an integer (got {raw_offset!r})."
             ) from None
@@ -2347,7 +2405,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             raw_percentile = args.get("percentile", 0.5)
             try:
                 percentile = float(raw_percentile)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 raise ToolInputError(
                     f"percentile must be a number between 0 and 1 "
                     f"(got {raw_percentile!r}); 0.5 is the median."
@@ -3152,6 +3210,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 success=False,
                 error_message=f"Unknown tool: {tool_name}",
             )
+        # `timeout` is the budget for the WHOLE call -- every query and
+        # retry the tool makes -- which is what keeps it under the Lambda
+        # timeout as the config's timeout ladder promises.
+        budget = self.plugin_config.timeout if self.plugin_config else None
+        deadline_token = _DEADLINE.set(time.monotonic() + budget if budget else None)
         try:
             output = await handler(arguments)
             return ToolResult(
@@ -3183,3 +3246,5 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 success=False,
                 error_message=str(e) if str(e) else "Tool execution failed",
             )
+        finally:
+            _DEADLINE.reset(deadline_token)
