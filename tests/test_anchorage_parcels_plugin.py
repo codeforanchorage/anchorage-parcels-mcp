@@ -2732,3 +2732,296 @@ class TestErrorHandling:
         await plugin.shutdown()
         client.aclose.assert_awaited_once()
         assert plugin.is_initialized is False
+
+
+def codes(structured):
+    return [c["code"] for c in structured["caveats"]]
+
+
+class TestMultipartParcelDetails:
+    """A parcel number carried by several features must still resolve.
+
+    39 parcel numbers on the live layer are multipart (one assessment
+    record drawn as up to 34 polygons) and 4 are filed under two
+    categories. get_parcel_details answered both with "pass the exact
+    11-digit Parcel_ID" -- to a caller who had just passed it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_multipart_parcel_resolves_to_one_record(self, plugin):
+        parts = [
+            feat(**dict(SAMPLE_RECORD, Parcel_ID="07605102000", OBJECTID=i))
+            for i in range(3)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 3}),
+                (is_feature_query, {"features": parts}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "07605102000"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is True
+        assert structured["summary"]["match_count"] == 3
+        assert structured["result"]["Parcel_ID"] == "07605102000"
+        assert structured["candidates"] == []
+        assert codes(structured) == ["multipart_parcel"]
+        text = tool_text(result)
+        assert "## Valuation" in text
+        assert "Which unit do you want?" not in text
+
+    @pytest.mark.asyncio
+    async def test_same_number_in_two_categories_asks_for_category(self, plugin):
+        rows = [
+            feat(**dict(SAMPLE_RECORD, Parcel_ID="01225440000", GIS_Category=c))
+            for c in ("Economic", "Parcel")
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 2}),
+                (is_feature_query, {"features": rows}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "01225440000"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is False
+        assert codes(structured) == ["multiple_records"]
+        message = structured["caveats"][0]["message"]
+        assert "category=" in message
+        assert "Economic, Parcel" in message
+        # The advice that cannot be followed is gone.
+        assert "Pass the exact 11-digit" not in message
+
+    @pytest.mark.asyncio
+    async def test_category_argument_filters_and_resolves(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})],
+        )
+        result = await run_tool(
+            plugin,
+            "get_parcel_details",
+            {"parcel_id": "00215132000", "category": "parcel"},
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is True
+        assert "(GIS_Category = 'Parcel')" in calls[0][1]["where"]
+
+    @pytest.mark.asyncio
+    async def test_no_category_filter_by_default(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})],
+        )
+        await run_tool(plugin, "get_parcel_details", {"parcel_id": "00215132000"})
+        assert "GIS_Category" not in calls[0][1]["where"]
+
+    @pytest.mark.asyncio
+    async def test_different_units_still_ask_which(self, plugin):
+        units = [
+            feat(**dict(SAMPLE_RECORD, Parcel_ID=f"0121820400{i}")) for i in (1, 2)
+        ]
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 2}),
+                (is_feature_query, {"features": units}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "get_parcel_details", {"parcel_id": "012-182-04"}
+        )
+        structured = assert_conforms(plugin, "get_parcel_details", result)
+        assert structured["summary"]["resolved"] is False
+        assert "Pass the exact 11-digit" in structured["caveats"][0]["message"]
+
+
+class TestListToolsReportTruncation:
+    """find_parcel and search_by_address must say when the page is not all.
+
+    Neither fetched a count, so 5 of 24 condo units came back labelled
+    "exact match" and 5 of 85 parcels on a street came back as the street.
+    """
+
+    @staticmethod
+    def _units(n):
+        return [
+            feat(**dict(SAMPLE_RECORD, Parcel_ID=f"012182040{i:02d}")) for i in range(n)
+        ]
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_full_page_reports_total(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 24}),
+                (is_feature_query, {"features": self._units(5)}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "find_parcel", {"parcel_id": "012-182-04", "limit": 5}
+        )
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["summary"]["returned_count"] == 5
+        assert structured["summary"]["total_count"] == 24
+        assert structured["summary"]["truncated"] is True
+        assert codes(structured)[0] == "results_truncated"
+        text = tool_text(result)
+        assert "5 of 24 record(s)" in text
+        assert "Raise `limit`" in text
+        assert sum(1 for c in calls if is_count(*c)) == 1
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_short_page_skips_the_count(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})],
+        )
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["summary"]["total_count"] == 1
+        assert structured["summary"]["truncated"] is False
+        assert "results_truncated" not in codes(structured)
+        assert not any(is_count(*c) for c in calls)
+
+    @pytest.mark.asyncio
+    async def test_find_parcel_count_failure_still_flags_more(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, RuntimeError("count endpoint down")),
+                (
+                    is_feature_query,
+                    {"features": self._units(5), "exceededTransferLimit": True},
+                ),
+            ],
+        )
+        result = await run_tool(
+            plugin, "find_parcel", {"parcel_id": "012-182-04", "limit": 5}
+        )
+        structured = assert_conforms(plugin, "find_parcel", result)
+        assert structured["summary"]["total_count"] is None
+        assert structured["summary"]["truncated"] is True
+        assert "MORE EXIST" in structured["caveats"][0]["message"]
+
+    @pytest.mark.asyncio
+    async def test_search_by_address_full_page_reports_total(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (is_count, {"count": 85}),
+                (is_feature_query, {"features": self._units(5)}),
+            ],
+        )
+        result = await run_tool(
+            plugin, "search_by_address", {"address": "W 15TH AVE", "limit": 5}
+        )
+        structured = assert_conforms(plugin, "search_by_address", result)
+        assert structured["summary"]["total_count"] == 85
+        assert structured["summary"]["truncated"] is True
+        assert codes(structured)[0] == "results_truncated"
+        assert "returned 5 of 85" in tool_text(result)
+        assert "more specific address" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_search_by_address_short_page_is_complete(self, plugin):
+        calls = install_client(
+            plugin,
+            routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})],
+        )
+        result = await run_tool(
+            plugin, "search_by_address", {"address": "144 W 15TH AVE"}
+        )
+        structured = assert_conforms(plugin, "search_by_address", result)
+        assert structured["summary"]["total_count"] == 1
+        assert structured["summary"]["truncated"] is False
+        assert not any(is_count(*c) for c in calls)
+
+
+class TestGroupedStatsReportTruncation:
+    """A grouped statistic returns one page of groups; it must say so.
+
+    group_by='Owner_Name' returned 2,000 of ~82,000 owners, alphabetically,
+    with nothing to distinguish it from the complete list.
+    """
+
+    @staticmethod
+    def _stats_route(n, exceeded):
+        payload = {
+            "features": [
+                feat(Owner_Name=f"OWNER {i:04d}", count_Parcel_ID=1) for i in range(n)
+            ]
+        }
+        if exceeded:
+            payload["exceededTransferLimit"] = True
+        return (lambda url, params: "outStatistics" in params, payload)
+
+    ARGS = {"stat_type": "count", "stat_field": "Parcel_ID", "group_by": "Owner_Name"}
+
+    @pytest.mark.asyncio
+    async def test_truncated_groups_are_flagged_with_total(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                self._stats_route(4, exceeded=True),
+                (is_count, {"count": 82382}),
+            ],
+        )
+        result = await run_tool(plugin, "parcel_stats", dict(self.ARGS))
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["summary"]["group_count"] == 4
+        assert structured["summary"]["total_group_count"] == 82382
+        assert structured["summary"]["truncated"] is True
+        assert "results_truncated" in codes(structured)
+        text = tool_text(result)
+        assert "first 4 of about 82,382 groups" in text
+        assert "MORE EXIST" in text
+
+    @pytest.mark.asyncio
+    async def test_truncated_groups_flagged_when_total_unknown(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                self._stats_route(4, exceeded=True),
+                (is_count, RuntimeError("count endpoint down")),
+            ],
+        )
+        result = await run_tool(plugin, "parcel_stats", dict(self.ARGS))
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["summary"]["total_group_count"] is None
+        assert structured["summary"]["truncated"] is True
+        assert "only the first 4 groups" in tool_text(result)
+
+    @pytest.mark.asyncio
+    async def test_complete_groups_make_no_extra_call(self, plugin):
+        calls = install_client(plugin, routes=[self._stats_route(3, exceeded=False)])
+        result = await run_tool(plugin, "parcel_stats", dict(self.ARGS))
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["summary"]["total_group_count"] == 3
+        assert structured["summary"]["truncated"] is False
+        assert "results_truncated" not in codes(structured)
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_ungrouped_statistic_is_never_truncated(self, plugin):
+        install_client(
+            plugin,
+            routes=[
+                (
+                    lambda url, params: "outStatistics" in params,
+                    {"features": [feat(count_Parcel_ID=97368)]},
+                )
+            ],
+        )
+        result = await run_tool(
+            plugin, "parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"}
+        )
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert structured["summary"]["total_group_count"] is None
+        assert structured["summary"]["truncated"] is False

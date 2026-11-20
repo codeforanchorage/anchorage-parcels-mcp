@@ -181,6 +181,7 @@ CAVEAT_CODES = (
     "fuzzy_search_failed",  # the fallback search errored: NOT "no parcel"
     "base_number_match",  # the sub-parcel asked for does not exist
     "multiple_records",  # the ID resolves to several records (condos)
+    "multipart_parcel",  # one record drawn as several polygons; shown once
     "address_point_fallback",  # resolved via address layer + point-in-polygon
     "no_address_match",  # neither situs nor address-point matched
     "point_outside_parcels",  # the point falls in no property polygon
@@ -891,6 +892,46 @@ class AnchorageParcelsPlugin(MCPPlugin):
             logger.warning(f"count query failed for where={where!r}: {e}")
             return None
 
+    async def _total_for_page(
+        self,
+        where: str,
+        records: List[Dict[str, Any]],
+        limit: int,
+        exceeded: bool,
+    ) -> Optional[int]:
+        """Total records matching `where`, for a page already fetched.
+
+        A page shorter than the limit IS the whole result, so the count
+        endpoint is only consulted when the page came back full -- the
+        one case where more may exist. None means the count could not be
+        established, which is not the same as "no more".
+        """
+        if len(records) < limit and not exceeded:
+            return len(records)
+        return await self._fetch_count(where)
+
+    async def _fetch_distinct_count(self, where: str, field: str) -> Optional[int]:
+        """How many distinct values `field` takes under a WHERE clause.
+
+        The server counts distinct NON-NULL values, so this can be one
+        short of the number of groups a statistics query returns."""
+        try:
+            data = await self._layer_query(
+                f"{self.plugin_config.property_layer_url}/query",
+                {
+                    "f": "json",
+                    "where": where,
+                    "outFields": field,
+                    "returnDistinctValues": "true",
+                    "returnCountOnly": "true",
+                    "returnGeometry": "false",
+                },
+            )
+            return data.get("count")
+        except Exception as e:
+            logger.warning(f"distinct count failed for {field}: {e}")
+            return None
+
     async def _query_property_layer(
         self,
         where: str,
@@ -1043,6 +1084,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         out_fields: Optional[str] = None,
         heading: Optional[str] = None,
         caveats: Optional["_Caveats"] = None,
+        truncation_advice: Optional[str] = None,
+        more_exist: bool = False,
     ) -> str:
         """List records with provenance header, TOTAL COUNT line, and a
         truncation banner (conventions from anchorage_gis
@@ -1058,15 +1101,28 @@ class AnchorageParcelsPlugin(MCPPlugin):
         truncated = (
             total_count is not None and len(records) > 0 and total_count > len(records)
         )
+        advice = truncation_advice or (
+            "Use the TOTAL COUNT line below for 'how many?' questions, or "
+            "page with offset / narrow the WHERE clause."
+        )
         if truncated:
             caveats.add_first(
                 "results_truncated",
                 f"**TRUNCATED:** returned {len(records)} of "
                 f"{total_count:,} matching records (limit={limit}). The "
                 f"records below are a SAMPLE -- do not generalize counts "
-                f"or totals from them. Use the TOTAL COUNT line below for "
-                f"'how many?' questions, or page with offset / narrow the "
-                f"WHERE clause.",
+                f"or totals from them. {advice}",
+            )
+        elif total_count is None and more_exist and records:
+            # The server said more rows remain but the count could not be
+            # fetched: still say so, rather than present a full page as
+            # the whole answer.
+            caveats.add_first(
+                "results_truncated",
+                f"**TRUNCATED:** returned the first {len(records)} matching "
+                f"records (limit={limit}); MORE EXIST, but the total could "
+                f"not be counted. The records below are a SAMPLE -- do not "
+                f"generalize counts or totals from them. {advice}",
             )
         self._render_caveats(lines, caveats)
         lines.append("")
@@ -1282,24 +1338,32 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "variants_tried": variants,
         }
 
-        records, _ = await self._query_property_layer(where, out_fields, limit)
+        records, exceeded = await self._query_property_layer(where, out_fields, limit)
         base_note = None
         if not records and base_where:
             where = self._combine_where(base_where, category_clause)
-            records, _ = await self._query_property_layer(where, out_fields, limit)
+            records, exceeded = await self._query_property_layer(
+                where, out_fields, limit
+            )
             if records:
                 base_note = fallback_note
                 query["where"] = where
         if records:
+            # A base number can name a whole condominium: without a count
+            # the first `limit` units read as the complete answer.
+            total = await self._total_for_page(where, records, limit, exceeded)
             caveats.add_first("base_number_match", base_note)
             how = (
                 "matched on the base number, not the sub-parcel"
                 if base_note
                 else "exact match"
             )
+            shown = f"{len(records)}"
+            if total is not None and total > len(records):
+                shown += f" of {total:,}"
             heading = (
                 f"## Parcel lookup: `{parcel_id}` -> "
-                f"{len(records)} record(s) ({how})\n"
+                f"{shown} record(s) ({how})\n"
                 f"Variants tried ({len(variants)}): "
                 + ", ".join(f"`{v}`" for v in variants)
                 + "\n"
@@ -1307,10 +1371,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
             text = self._format_records(
                 records,
                 limit,
+                total_count=total,
                 where=where,
                 out_fields=out_fields,
                 heading=heading,
                 caveats=caveats,
+                truncation_advice=(
+                    "Raise `limit` (maximum 100), or page through all of "
+                    "them with query_parcels and offset."
+                ),
+                more_exist=exceeded,
             )
             return _ToolOutput(
                 text,
@@ -1318,6 +1388,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     query,
                     {
                         "returned_count": len(records),
+                        "total_count": total,
+                        "truncated": bool(
+                            (total is not None and total > len(records))
+                            or (total is None and exceeded)
+                        ),
                         "exact_match": base_note is None,
                     },
                     caveats,
@@ -1425,7 +1500,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "\n".join(lines),
             self._envelope(
                 query,
-                {"returned_count": len(candidates), "exact_match": False},
+                {
+                    "returned_count": len(candidates),
+                    "total_count": 0,
+                    "truncated": False,
+                    "exact_match": False,
+                },
                 caveats,
                 rows=candidates,
             ),
@@ -1447,10 +1527,22 @@ class AnchorageParcelsPlugin(MCPPlugin):
         where, base_where, fallback_note = self._parcel_number_wheres(
             parcel_id, variants
         )
+        # Unlike the list tools, no category filter unless one is asked
+        # for: a parcel number names its record whatever it is filed as.
+        # The argument exists for the few numbers filed under two
+        # categories at once, which nothing else can tell apart.
+        category = args.get("category")
+        category_clause = (
+            self._category_clause(category) if category not in (None, "") else None
+        )
+        where = self._combine_where(where, category_clause)
+        if base_where:
+            base_where = self._combine_where(base_where, category_clause)
 
         caveats = _Caveats()
         query = {
             "parcel_id": parcel_id,
+            "category": category,
             "where": where,
             "variants_tried": variants,
         }
@@ -1470,7 +1562,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"No property record found for `{parcel_id}`. "
                 f"Try `find_parcel('{parcel_id}')` -- it adds a fuzzy "
                 f"fallback and can search Lease/Economic records with "
-                f"category='All'.",
+                f"category='All'."
+                + (
+                    f" This lookup was limited to category={category!r}; "
+                    f"omit it to search every category."
+                    if category_clause
+                    else ""
+                ),
             )
             return _ToolOutput(
                 "\n".join(caveats.messages),
@@ -1489,6 +1587,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # Set only when rows came back for the base number instead of
         # the sub-parcel asked for; a miss above needs no such note.
         caveats.add("base_number_match", base_note)
+        match_count, is_lower_bound = 1, False
+        full_record = records[0]
+        same_record = False
+        categories: List[str] = []
         if len(records) > 1:
             # Condos share a parcel root; Parcel_ID_Count > 1 marks it.
             # Refetch slim columns so every unit is listed -- large
@@ -1522,13 +1624,48 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 match_count, is_lower_bound = total, False
             else:
                 match_count, is_lower_bound = len(records), True
-            caveats.add(
-                "multiple_records",
-                f"`{parcel_id}` matches {total} records (condo "
-                f"units and lease/economic overlays share parcel roots). "
-                f"Which unit do you want? Pass the exact 11-digit "
-                f"{self._f('parcel_id')} to get_parcel_details:",
+            id_field, cat_field = self._f("parcel_id"), self._f("category")
+            distinct_ids = {r.get(id_field) for r in records}
+            categories = sorted({str(r.get(cat_field)) for r in records})
+            # Every row carrying ONE parcel number: there is no "exact
+            # 11-digit ID" left to ask for. Asking anyway sent the caller
+            # round in a circle -- the ID they had just passed came back
+            # as a list of itself.
+            same_record = (
+                not exceeded
+                and len(distinct_ids) == 1
+                and bool(next(iter(distinct_ids)))
             )
+        if len(records) > 1 and same_record and len(categories) == 1:
+            # A multipart parcel: one assessment record drawn as several
+            # polygons. The parts differ only in their geometry fields.
+            caveats.add(
+                "multipart_parcel",
+                f"**MULTIPART PARCEL:** `{full_record.get(id_field)}` is one "
+                f"assessment record drawn as {match_count} separate polygons. "
+                f"It is shown once: the assessment fields are the same on "
+                f"every part, while geometry fields such as Shape__Area "
+                f"describe ONE polygon, not the whole parcel. Count it as "
+                f"one parcel, not {match_count}.",
+            )
+        elif len(records) > 1:
+            if same_record:
+                caveats.add(
+                    "multiple_records",
+                    f"`{parcel_id}` is filed under {len(categories)} "
+                    f"categories at once ({', '.join(categories)}) with the "
+                    f"same parcel number. Call get_parcel_details again "
+                    f"with category= one of those ('Parcel' is the regular "
+                    f"assessment record):",
+                )
+            else:
+                caveats.add(
+                    "multiple_records",
+                    f"`{parcel_id}` matches {total} records (condo "
+                    f"units and lease/economic overlays share parcel roots). "
+                    f"Which unit do you want? Pass the exact 11-digit "
+                    f"{self._f('parcel_id')} to get_parcel_details:",
+                )
             lines: List[str] = []
             self._render_caveats(lines, caveats)
             lines.append("")
@@ -1565,7 +1702,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 ),
             )
 
-        r = records[0]
+        r = full_record
 
         def v(logical: str) -> Any:
             physical = self._f(logical)
@@ -1671,8 +1808,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
             self._envelope(
                 query,
                 {
-                    "match_count": 1,
-                    "match_count_is_lower_bound": False,
+                    "match_count": match_count,
+                    "match_count_is_lower_bound": is_lower_bound,
                     "resolved": True,
                 },
                 caveats,
@@ -1795,13 +1932,17 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "limit": limit,
         }
 
-        records, _ = await self._query_property_layer(
+        records, exceeded = await self._query_property_layer(
             where, self._summary_fields, limit
         )
         if records:
+            # A street name alone matches every parcel on the street:
+            # without a count the first `limit` read as all of them.
+            total = await self._total_for_page(where, records, limit, exceeded)
             text = self._format_records(
                 records,
                 limit,
+                total_count=total,
                 where=where,
                 out_fields=self._summary_fields,
                 heading=(
@@ -1809,6 +1950,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"(matched directly on {situs_field})\n"
                 ),
                 caveats=caveats,
+                truncation_advice=(
+                    "Give a more specific address (house number + street), "
+                    "raise `limit` (maximum 100), or page through all of "
+                    "them with query_parcels and offset."
+                ),
+                more_exist=exceeded,
             )
             return _ToolOutput(
                 text,
@@ -1816,6 +1963,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     query,
                     {
                         "returned_count": len(records),
+                        "total_count": total,
+                        "truncated": bool(
+                            (total is not None and total > len(records))
+                            or (total is None and exceeded)
+                        ),
                         "match_method": "situs",
                         "matched_address_point": None,
                         "address_point": None,
@@ -1857,6 +2009,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     query,
                     {
                         "returned_count": 0,
+                        "total_count": 0,
+                        "truncated": False,
                         "match_method": "none",
                         "matched_address_point": None,
                         "address_point": None,
@@ -1884,6 +2038,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         summary = {
             "returned_count": len(pip_records),
+            # The point lookup is capped; a full page may not be all of it.
+            "total_count": (
+                len(pip_records) if len(pip_records) < self.POINT_QUERY_LIMIT else None
+            ),
+            "truncated": False,
             "match_method": "address_point",
             "matched_address_point": matched_addr,
             "address_point": {"lon": lon, "lat": lat},
@@ -2214,6 +2373,25 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         rows = [f.get("attributes") or {} for f in data.get("features") or []]
 
+        # A grouped statistic comes back one page at most. Grouping on a
+        # high-cardinality field (owner, address) used to return the first
+        # page -- alphabetically -- as if it were every group.
+        groups_truncated = bool(group_by and rows and data.get("exceededTransferLimit"))
+        total_groups: Optional[int] = len(rows) if group_by else None
+        if groups_truncated:
+            total_groups = await self._fetch_distinct_count(full_where, group_by)
+            if total_groups is not None and total_groups <= len(rows):
+                total_groups = None
+            of_total = f" of about {total_groups:,}" if total_groups else ""
+            caveats.add(
+                "results_truncated",
+                f"**GROUPS TRUNCATED:** only the first {len(rows):,}{of_total} "
+                f"groups are returned, in {group_by} order -- NOT the largest "
+                f"or smallest. Any ranking, total or 'how many groups' read "
+                f"from this list is incomplete. Narrow it with `where`, or "
+                f"group by a coarser field.",
+            )
+
         stat_label = stat_type
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
@@ -2242,7 +2420,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
             self._render_caveats(lines, caveats)
             return _ToolOutput(
                 "\n".join(lines) + self._no_data_hint(full_where),
-                self._envelope(query, {"group_count": 0}, caveats, rows=[]),
+                self._envelope(
+                    query,
+                    {
+                        "group_count": 0,
+                        "total_group_count": 0 if group_by else None,
+                        "truncated": False,
+                    },
+                    caveats,
+                    rows=[],
+                ),
             )
         # Render caveats on the SUCCESS path too. The zero-result branch
         # above already does; without this, a caveat could exist in
@@ -2273,13 +2460,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if group_by:
             lines += [
                 "",
-                f"({len(rows)} group(s); groups are ordered by {group_by}.)",
+                f"({len(rows)} group(s)"
+                + (" shown, MORE EXIST" if groups_truncated else "")
+                + f"; groups are ordered by {group_by}.)",
             ]
         return _ToolOutput(
             "\n".join(lines),
             self._envelope(
                 query,
-                {"group_count": len(structured_rows)},
+                {
+                    "group_count": len(structured_rows),
+                    "total_group_count": total_groups,
+                    "truncated": groups_truncated,
+                },
                 caveats,
                 rows=structured_rows,
             ),
@@ -2393,6 +2586,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
             },
             {
                 "returned_count": {"type": "integer"},
+                "total_count": _NULLABLE_COUNT,
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when more records match than `rows` holds "
+                        "(a base number can name a whole condominium)."
+                    ),
+                },
                 "exact_match": {
                     "type": "boolean",
                     "description": (
@@ -2411,11 +2612,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "when the ID is ambiguous (condo units share parcel roots).",
             {
                 "parcel_id": {"type": "string"},
+                "category": {"type": ["string", "null"]},
                 "where": {"type": "string"},
                 "variants_tried": {"type": "array", "items": {"type": "string"}},
             },
             {
-                "match_count": {"type": "integer"},
+                "match_count": {
+                    "type": "integer",
+                    "description": (
+                        "Features matching the number. Above 1 with "
+                        "resolved=true means a multipart parcel: one "
+                        "record drawn as several polygons."
+                    ),
+                },
                 "match_count_is_lower_bound": {
                     "type": "boolean",
                     "description": (
@@ -2478,6 +2687,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
             },
             {
                 "returned_count": {"type": "integer"},
+                "total_count": _NULLABLE_COUNT,
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when more parcels match the address than `rows` holds."
+                    ),
+                },
                 "match_method": {
                     "type": "string",
                     "enum": ["situs", "address_point", "none"],
@@ -2557,7 +2773,25 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "where": {"type": "string"},
                 "category": {"type": ["string", "null"]},
             },
-            {"group_count": {"type": "integer"}},
+            {
+                "group_count": {"type": "integer"},
+                "total_group_count": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "Groups that exist. Equals group_count unless "
+                        "truncated; then an approximate total, or null "
+                        "when it could not be counted. Null when ungrouped."
+                    ),
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when more groups exist than `rows` holds. "
+                        "`rows` is then the first page in group_by order, "
+                        "not a ranking."
+                    ),
+                },
+            },
             {
                 "rows": {
                     "type": "array",
@@ -2646,7 +2880,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"deed/plat, and the assessor Datalet link. If the "
                     f"ID matches multiple records (condo units share "
                     f"parcel roots) it lists them so you can pick the "
-                    f"unit. Example: "
+                    f"unit. A multipart parcel (one record drawn as "
+                    f"several polygons) is returned once. Example: "
                     f"get_parcel_details(parcel_id='00215132000'). "
                     f"{CASE_SENSITIVE_NOTE}"
                 ),
@@ -2658,6 +2893,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             "description": (
                                 "Parcel number in any format (hyphens "
                                 "optional, 8 or 11 digits)"
+                            ),
+                        },
+                        "category": {
+                            "type": "string",
+                            "enum": list(CATEGORY_VALUES) + ["All"],
+                            "description": (
+                                "Optional, and rarely needed: by default "
+                                "every category is searched. Pass it only "
+                                "when the response says one parcel number "
+                                "is filed under several categories."
                             ),
                         },
                     },
@@ -2829,7 +3074,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"Aggregate statistics over {city} property records: "
                     f"count, sum, avg, min, max, stddev, var, or "
                     f"percentile_cont (median = percentile_cont with "
-                    f"percentile=0.5), optionally grouped. Example -- "
+                    f"percentile=0.5), optionally grouped (one page of "
+                    f"groups at most, in group_by order; the response says "
+                    f"when more exist). Example -- "
                     f"median assessed value by zoning district: "
                     f"parcel_stats(stat_type='percentile_cont', "
                     f"stat_field='Appraised_Total_Value', "
