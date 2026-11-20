@@ -60,7 +60,9 @@ plugins:
     # Logical -> physical field-name overrides (see DEFAULT_FIELD_MAP in
     # plugins/anchorage_parcels/plugin.py). Empty for MOA.
     field_map: {}
-    # Per-request HTTP timeout to ArcGIS. Kept well UNDER the Lambda
+    # Time budget, in seconds, for ONE TOOL CALL: every ArcGIS query and
+    # retry the call makes shares it (it is also the per-request HTTP
+    # timeout, so nothing waits longer). Kept well UNDER the Lambda
     # timeout (aws.lambda_timeout below) so a hung upstream surfaces as a
     # clean tool error the model can read, instead of the Lambda being
     # killed mid-flight and the caller getting an opaque gateway error.

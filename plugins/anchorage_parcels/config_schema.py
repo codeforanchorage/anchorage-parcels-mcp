@@ -63,7 +63,13 @@ class AnchorageParcelsPluginConfig(BaseModel):
         ),
     )
     timeout: int = Field(
-        default=30, ge=1, le=300, description="HTTP request timeout in seconds"
+        default=30,
+        ge=1,
+        le=300,
+        description=(
+            "Seconds allowed for one tool call, shared by every ArcGIS "
+            "request and retry it makes; also the per-request HTTP timeout"
+        ),
     )
 
     @field_validator(

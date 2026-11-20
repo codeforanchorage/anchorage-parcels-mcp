@@ -9,11 +9,14 @@ for the live end-to-end checks.
 """
 
 import ast
+import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import httpx
 import pytest
 from jsonschema import Draft202012Validator
 from pydantic import ValidationError
@@ -3025,3 +3028,166 @@ class TestGroupedStatsReportTruncation:
         structured = assert_conforms(plugin, "parcel_stats", result)
         assert structured["summary"]["total_group_count"] is None
         assert structured["summary"]["truncated"] is False
+
+
+class TestToolCallTimeBudget:
+    """`timeout` bounds the WHOLE tool call, retries included.
+
+    Each of the three attempts used to get its own 20s, so a hung
+    upstream ran to 60s against a 28s Lambda: the Lambda was killed
+    mid-retry and the caller got a gateway error, not a tool error.
+    """
+
+    @staticmethod
+    def _client(side_effect):
+        client = Mock()
+        client.get = AsyncMock(side_effect=side_effect)
+        client.aclose = AsyncMock()
+        return client
+
+    @pytest.mark.asyncio
+    async def test_hung_upstream_returns_a_tool_error_inside_the_budget(self, plugin):
+        async def hang(url, params=None):
+            await asyncio.sleep(30)
+
+        plugin.plugin_config.timeout = 0.05
+        plugin.client = self._client(hang)
+        started = time.monotonic()
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        assert time.monotonic() - started < 2
+        assert result.success is False
+        assert "did not answer within" in result.error_message
+        assert "NOT 'no results'" in result.error_message
+        # No second attempt was started with a fresh timeout.
+        assert plugin.client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_no_retry_when_the_backoff_would_overrun_the_budget(self, plugin):
+        plugin.plugin_config.timeout = 0.2  # first backoff alone is 0.5s
+        plugin.client = self._client(httpx.ConnectError("refused"))
+        result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        assert result.success is False
+        assert "did not answer within" in result.error_message
+        assert plugin.client.get.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_still_retried_within_the_budget(self, plugin):
+        responses = [
+            httpx.ConnectError("blip"),
+            make_response({"features": [feat(**SAMPLE_RECORD)]}),
+        ]
+
+        async def flaky(url, params=None):
+            item = responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        plugin.client = self._client(flaky)
+        with patch("plugins.anchorage_parcels.plugin.asyncio.sleep", AsyncMock()):
+            result = await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        assert result.success, result.error_message
+        assert plugin.client.get.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_budget_does_not_leak_out_of_the_tool_call(self, plugin):
+        from plugins.anchorage_parcels.plugin import _DEADLINE
+
+        install_client(
+            plugin,
+            routes=[(is_feature_query, {"features": [feat(**SAMPLE_RECORD)]})],
+        )
+        await run_tool(plugin, "find_parcel", {"parcel_id": "002-151-32"})
+        assert _DEADLINE.get() is None
+
+
+class TestNonFiniteNumbersAreCallerErrors:
+    """JSON `1e999` parses to float inf, and int(inf) raises OverflowError
+    -- which was not caught, so a caller's bad number logged a traceback
+    as if the server had failed."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tool,args,needle",
+        [
+            ("query_parcels", {"where": "1=1", "limit": float("inf")}, "limit"),
+            ("query_parcels", {"where": "1=1", "offset": float("inf")}, "offset"),
+            (
+                "find_parcel",
+                {"parcel_id": "002-151-32", "limit": float("inf")},
+                "limit",
+            ),
+            ("parcels_at_point", {"lat": 10**400, "lon": -149.9}, "lat and lon"),
+            (
+                "parcel_stats",
+                {
+                    "stat_type": "percentile_cont",
+                    "stat_field": "Appraised_Total_Value",
+                    "percentile": 10**400,
+                },
+                "percentile",
+            ),
+        ],
+    )
+    async def test_rejected_without_a_traceback(
+        self, plugin, caplog, tool, args, needle
+    ):
+        install_client(plugin)
+        with caplog.at_level(logging.WARNING):
+            result = await run_tool(plugin, tool, args)
+        assert result.success is False
+        assert needle in result.error_message
+        assert caplog.records, "the rejection should be logged"
+        for record in caplog.records:
+            assert record.levelno == logging.WARNING, record.getMessage()
+            assert not record.exc_info
+
+
+class TestLikeWildcardsAreLiteral:
+    """`%` and `_` in a name or address are data, not wildcards.
+
+    Live, search_by_owner('_') matched all ~97,000 records and '100%'
+    matched '100TH AVENUE BUSINESS PARK'.
+    """
+
+    @staticmethod
+    def _where(calls):
+        return next(c[1]["where"] for c in calls if is_feature_query(*c))
+
+    @pytest.mark.asyncio
+    async def test_owner_percent_is_escaped(self, plugin):
+        calls = install_client(plugin)
+        await run_tool(plugin, "search_by_owner", {"name": "100%"})
+        assert r"UPPER(Owner_Name) LIKE '%100\%%' ESCAPE '\'" in self._where(calls)
+
+    @pytest.mark.asyncio
+    async def test_owner_underscore_is_escaped_in_every_mode(self, plugin):
+        for mode, expected in (
+            ("contains", r"LIKE '%A\_B%' ESCAPE '\'"),
+            ("starts_with", r"LIKE 'A\_B%' ESCAPE '\'"),
+            ("surname", r"LIKE 'A\_B %' ESCAPE '\' OR UPPER(Owner_Name) = 'A_B'"),
+        ):
+            calls = install_client(plugin)
+            await run_tool(plugin, "search_by_owner", {"name": "a_b", "match": mode})
+            assert expected in self._where(calls), mode
+
+    @pytest.mark.asyncio
+    async def test_plain_name_gets_no_escape_clause(self, plugin):
+        calls = install_client(plugin)
+        await run_tool(plugin, "search_by_owner", {"name": "O'Brien"})
+        where = self._where(calls)
+        assert "UPPER(Owner_Name) LIKE '%O''BRIEN%'" in where
+        assert "ESCAPE" not in where
+
+    @pytest.mark.asyncio
+    async def test_address_wildcards_escaped_on_both_layers(self, plugin):
+        calls = install_client(plugin)
+        await run_tool(plugin, "search_by_address", {"address": "1_0 W 15th"})
+        expected = r"LIKE '%1\_0 W 15TH%' ESCAPE '\'"
+        assert f"Parcel_Address {expected}" in calls[0][1]["where"]
+        addr_call = next(c for c in calls if DEFAULT_ADDRESSES_LAYER_URL in c[0])
+        assert addr_call[1]["where"] == f"FULL_ADDRESS {expected}"
+
+    def test_backslash_itself_is_escaped(self):
+        clause = AnchorageParcelsPlugin._like("F", "A\\B")
+        assert clause == r"F LIKE '%A\\B%' ESCAPE '\'"
