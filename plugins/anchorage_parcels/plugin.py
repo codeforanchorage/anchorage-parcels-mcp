@@ -369,6 +369,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
     # query page can never exceed this; query_parcels pages with
     # resultOffset when the caller's limit is larger.
     SERVER_PAGE_SIZE = 2000
+    # parcel_stats group orderings: by the group_by value, or by the
+    # statistic itself.
+    STAT_ORDERS = ("group", "value_desc", "value_asc")
     # Hard cap on records in one tool response.
     MAX_LIMIT = 1000
     # Above this many records, _format_records switches from per-record
@@ -832,6 +835,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"the maximum of {maximum}; returning at most {maximum}."
             )
         return limit, note
+
+    @staticmethod
+    def _parse_offset(args: Dict[str, Any]) -> int:
+        raw_offset = args.get("offset", 0)
+        try:
+            return max(0, int(raw_offset))
+        except (TypeError, ValueError, OverflowError):
+            raise ToolInputError(
+                f"offset must be an integer (got {raw_offset!r})."
+            ) from None
 
     def _check_field_exists(self, field: str, arg_name: str) -> str:
         """Validate a single field-name argument against the live schema."""
@@ -2343,13 +2356,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=100, maximum=self.MAX_LIMIT)
         if clamp_note:
             clamp_note += " Page with offset= for more."
-        raw_offset = args.get("offset", 0)
-        try:
-            offset = max(0, int(raw_offset))
-        except (TypeError, ValueError, OverflowError):
-            raise ToolInputError(
-                f"offset must be an integer (got {raw_offset!r})."
-            ) from None
+        offset = self._parse_offset(args)
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
         # Caveats are collected from here on, because the zoning expansion
@@ -2463,12 +2470,39 @@ class AnchorageParcelsPlugin(MCPPlugin):
         group_by = str(args.get("group_by") or "").strip()
         if group_by:
             group_by = self._check_field_exists(group_by, "group_by")
+        order_by = str(args.get("order_by") or "group").strip().lower()
+        if order_by not in self.STAT_ORDERS:
+            raise ToolInputError(
+                f"order_by must be one of {list(self.STAT_ORDERS)} "
+                f"(got {order_by!r}). 'value_desc' lists the groups with the "
+                f"largest statistic first."
+            )
+        # Ordering and paging apply to groups. Refused, not ignored, on
+        # an ungrouped statistic: there the result is one number, and a
+        # caller who passed them meant to group.
+        paging_args = [k for k in ("limit", "offset") if args.get(k) is not None]
+        if order_by != "group":
+            paging_args.insert(0, "order_by")
+        if paging_args and not group_by:
+            raise ToolInputError(
+                f"{' / '.join(paging_args)} can only be used with a grouped "
+                f"statistic: pass group_by as well (e.g. "
+                f"group_by='Owner_Name', order_by='value_desc', limit=10 for "
+                f"the ten owners with the largest value)."
+            )
+        limit, clamp_note = self._clamp_limit(
+            args, default=self.SERVER_PAGE_SIZE, maximum=self.SERVER_PAGE_SIZE
+        )
+        if clamp_note:
+            clamp_note += " Page with offset= for more."
+        offset = self._parse_offset(args)
         raw_where = str(args.get("where") or "").strip()
         where = WhereValidator.validate(raw_where or "1=1")
         self._validate_where_fields(where)
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
         caveats = _Caveats()
+        caveats.add("limit_clamped", clamp_note)
         where = await self._expand_zoning_variants(where, caveats)
         full_where = self._combine_where(
             where, category_clause, self._assessed_clause(include_unassessed)
@@ -2505,7 +2539,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
         }
         if group_by:
             params["groupByFieldsForStatistics"] = group_by
-            params["orderByFields"] = group_by
+            if order_by == "group":
+                params["orderByFields"] = group_by
+            else:
+                # The group is the tie-break, so that groups with equal
+                # values keep one order from page to page.
+                direction = "DESC" if order_by == "value_desc" else "ASC"
+                params["orderByFields"] = f"{out_name} {direction},{group_by} ASC"
+            params["resultRecordCount"] = str(limit)
+            if offset:
+                params["resultOffset"] = str(offset)
         data = await self._layer_query(
             f"{self.plugin_config.property_layer_url}/query", params
         )
@@ -2515,19 +2558,45 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # high-cardinality field (owner, address) used to return the first
         # page -- alphabetically -- as if it were every group.
         groups_truncated = bool(group_by and rows and data.get("exceededTransferLimit"))
-        total_groups: Optional[int] = len(rows) if group_by else None
-        if groups_truncated:
+        next_offset = offset + len(rows) if groups_truncated else None
+        total_groups: Optional[int] = None
+        if group_by and not offset and not groups_truncated:
+            total_groups = len(rows)
+        elif group_by and (rows or offset):
+            # A later page, or a cut one: this page does not say how many
+            # groups there are.
             total_groups = await self._fetch_distinct_count(full_where, group_by)
-            if total_groups is not None and total_groups <= len(rows):
-                total_groups = None
+            if rows and total_groups is not None and total_groups < offset + len(rows):
+                # The server counts distinct NON-NULL values, so it can be
+                # one short of the groups; never report fewer than seen.
+                total_groups = None if groups_truncated else offset + len(rows)
+        if groups_truncated and order_by == "group":
             of_total = f" of about {total_groups:,}" if total_groups else ""
+            which = (
+                f"groups {offset + 1:,}-{offset + len(rows):,}"
+                if offset
+                else f"the first {len(rows):,}"
+            )
             caveats.add(
                 "results_truncated",
-                f"**GROUPS TRUNCATED:** only the first {len(rows):,}{of_total} "
+                f"**GROUPS TRUNCATED:** only {which}{of_total} "
                 f"groups are returned, in {group_by} order -- NOT the largest "
                 f"or smallest. Any ranking, total or 'how many groups' read "
-                f"from this list is incomplete. Narrow it with `where`, or "
-                f"group by a coarser field.",
+                f"from this list is incomplete. For a ranking pass "
+                f"order_by='value_desc' (or 'value_asc') with a limit; "
+                f"otherwise narrow it with `where`, group by a coarser "
+                f"field, or page on with offset={next_offset}.",
+            )
+        elif groups_truncated:
+            of_total = f" of about {total_groups:,} groups" if total_groups else ""
+            end = "largest" if order_by == "value_desc" else "smallest"
+            caveats.add(
+                "more_pages_available",
+                f"**MORE GROUPS EXIST:** these are ranks {offset + 1:,}-"
+                f"{offset + len(rows):,}{of_total}, {end} {stat_type} first. "
+                f"Call parcel_stats again with offset={next_offset} (same "
+                f"arguments) for the next ones. A total or 'how many groups' "
+                f"read from this list alone is incomplete.",
             )
 
         stat_label = stat_type
@@ -2540,6 +2609,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "include_unassessed": include_unassessed,
             "stat_field": stat_field,
             "group_by": group_by or None,
+            "order_by": order_by if group_by else None,
+            "limit": limit if group_by else None,
+            "offset": offset if group_by else None,
             "percentile": percentile,
             "where": full_where,
             "category": args.get("category"),
@@ -2554,16 +2626,32 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if not rows:
             # Zero-result branch: still emits conforming structured
             # content rather than short-circuiting past the envelope.
-            caveats.add("no_results", "No statistics returned (0 matching records).")
+            # An offset past the last group is not "nothing matches":
+            # only a count of zero groups says that.
+            past_the_end = bool(offset) and total_groups != 0
+            if past_the_end:
+                only = (
+                    f": there are only {total_groups:,}"
+                    if total_groups
+                    else " (the number of groups could not be counted)"
+                )
+                message = f"No groups at offset={offset:,}{only}. Use a smaller offset."
+            else:
+                message = "No statistics returned (0 matching records)."
+            caveats.add("no_results", message)
             self._render_caveats(lines, caveats)
             return _ToolOutput(
-                "\n".join(lines) + self._no_data_hint(full_where),
+                "\n".join(lines)
+                + ("" if past_the_end else self._no_data_hint(full_where)),
                 self._envelope(
                     query,
                     {
                         "group_count": 0,
-                        "total_group_count": 0 if group_by else None,
+                        "total_group_count": (
+                            (total_groups if offset else 0) if group_by else None
+                        ),
                         "truncated": False,
+                        "next_offset": None,
                     },
                     caveats,
                     rows=[],
@@ -2596,11 +2684,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
             else:
                 lines.append(f"- {shown}")
         if group_by:
+            ordered_by = {
+                "group": group_by,
+                "value_desc": f"{stat_label} of {stat_field}, largest first",
+                "value_asc": f"{stat_label} of {stat_field}, smallest first",
+            }[order_by]
             lines += [
                 "",
                 f"({len(rows)} group(s)"
                 + (" shown, MORE EXIST" if groups_truncated else "")
-                + f"; groups are ordered by {group_by}.)",
+                + f"; groups are ordered by {ordered_by}.)",
             ]
         return _ToolOutput(
             "\n".join(lines),
@@ -2610,6 +2703,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     "group_count": len(structured_rows),
                     "total_group_count": total_groups,
                     "truncated": groups_truncated,
+                    "next_offset": next_offset,
                 },
                 caveats,
                 rows=structured_rows,
@@ -2907,6 +3001,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "stat_type": {"type": "string"},
                 "stat_field": {"type": "string"},
                 "group_by": {"type": ["string", "null"]},
+                "order_by": {
+                    "type": ["string", "null"],
+                    "description": "How the groups are ordered; null when ungrouped.",
+                },
+                "limit": {"type": ["integer", "null"]},
+                "offset": {"type": ["integer", "null"]},
                 "percentile": {"type": ["number", "null"]},
                 "where": {"type": "string"},
                 "category": {"type": ["string", "null"]},
@@ -2916,17 +3016,26 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "total_group_count": {
                     "type": ["integer", "null"],
                     "description": (
-                        "Groups that exist. Equals group_count unless "
-                        "truncated; then an approximate total, or null "
-                        "when it could not be counted. Null when ungrouped."
+                        "Groups that exist. Equals group_count when `rows` "
+                        "is every group; on a cut or later page an "
+                        "approximate total, or null when it could not be "
+                        "counted. Null when ungrouped."
                     ),
                 },
                 "truncated": {
                     "type": "boolean",
                     "description": (
-                        "True when more groups exist than `rows` holds. "
-                        "`rows` is then the first page in group_by order, "
-                        "not a ranking."
+                        "True when more groups follow those in `rows`. "
+                        "With order_by='group' `rows` is then a page in "
+                        "group_by order, not a ranking; with 'value_desc' "
+                        "/ 'value_asc' it is the top of the ranking."
+                    ),
+                },
+                "next_offset": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "The offset that returns the next groups, or null "
+                        "when there are no more."
                     ),
                 },
             },
@@ -3212,13 +3321,17 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"Aggregate statistics over {city} property records: "
                     f"count, sum, avg, min, max, stddev, var, or "
                     f"percentile_cont (median = percentile_cont with "
-                    f"percentile=0.5), optionally grouped (one page of "
-                    f"groups at most, in group_by order; the response says "
-                    f"when more exist). Example -- "
+                    f"percentile=0.5), optionally grouped. Groups come "
+                    f"back in group_by order unless order_by says "
+                    f"otherwise, {self.SERVER_PAGE_SIZE:,} at most per call; "
+                    f"the response says when more exist. Examples -- "
                     f"median assessed value by zoning district: "
                     f"parcel_stats(stat_type='percentile_cont', "
                     f"stat_field='Appraised_Total_Value', "
-                    f"group_by='Zoning_District'). {CASE_SENSITIVE_NOTE} "
+                    f"group_by='Zoning_District'); the ten owners with the "
+                    f"most parcels: parcel_stats(stat_type='count', "
+                    f"stat_field='Parcel_ID', group_by='Owner_Name', "
+                    f"order_by='value_desc', limit=10). {CASE_SENSITIVE_NOTE} "
                     f"{unassessed_note} {counting_traps_note} {routing_note}"
                 ),
                 input_schema={
@@ -3245,6 +3358,38 @@ class AnchorageParcelsPlugin(MCPPlugin):
                             "description": (
                                 "Optional field to group by, e.g. "
                                 "'Zoning_District' or 'GIS_Category'"
+                            ),
+                        },
+                        "order_by": {
+                            "type": "string",
+                            "enum": list(self.STAT_ORDERS),
+                            "default": "group",
+                            "description": (
+                                "Order of the groups (needs group_by). "
+                                "'group' (default) sorts by the group_by "
+                                "value. 'value_desc' / 'value_asc' sort by "
+                                "the statistic, largest / smallest first: "
+                                "use these with `limit` for a top-N or "
+                                "bottom-N ranking, which is the only way "
+                                "to rank a field with more groups than one "
+                                "call returns (owners, addresses)."
+                            ),
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "default": self.SERVER_PAGE_SIZE,
+                            "minimum": 1,
+                            "maximum": self.SERVER_PAGE_SIZE,
+                            "description": ("Most groups to return (needs group_by)."),
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "default": 0,
+                            "minimum": 0,
+                            "description": (
+                                "Groups to skip, for paging (needs "
+                                "group_by): pass the previous response's "
+                                "next_offset with the same arguments."
                             ),
                         },
                         "where": {

@@ -27,7 +27,7 @@ case-sensitive everywhere.
 | `search_by_address(address, limit)` | Situs-address search; on zero hits it resolves the address via the municipal address-point layer and runs point-in-polygon, reporting which path was used. |
 | `parcels_at_point(lat, lon)` | Every property polygon containing a WGS84 point, across **all** categories (Parcel/Lease/Economic polygons can stack); each hit labeled. |
 | `query_parcels(where, out_fields, category, limit, offset, order_by)` | Escape hatch: validated SQL WHERE with pagination (`resultOffset`), a TOTAL COUNT line, and next-offset hints. |
-| `parcel_stats(stat_type, stat_field, group_by, where, category, percentile)` | `count/sum/avg/min/max/stddev/var/percentile_cont` with optional grouping. Median = `percentile_cont` with `percentile=0.5` (e.g. median `Appraised_Total_Value` by `Zoning_District`). |
+| `parcel_stats(stat_type, stat_field, group_by, where, category, percentile, order_by, limit, offset)` | `count/sum/avg/min/max/stddev/var/percentile_cont` with optional grouping. Median = `percentile_cont` with `percentile=0.5` (e.g. median `Appraised_Total_Value` by `Zoning_District`). Groups come back in `group_by` order, 2,000 at most per call; `order_by='value_desc'` / `'value_asc'` with `limit` ranks them instead (e.g. the ten owners with the most parcels), and `offset` pages on. |
 
 Data notes baked into the tools: owner names/addresses are stored
 UPPERCASE; records carry a `GIS_Category` of `Parcel`, `Lease`, or
