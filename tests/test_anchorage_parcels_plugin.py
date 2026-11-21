@@ -1270,9 +1270,7 @@ class TestQueryParcels:
         """The shared WhereValidator's recovery hint says "Call
         get_layer_schema" -- a tool on the GIS servers, not this one. The
         hint here must point at something a caller of THIS server can
-        actually do. The plugin swaps that sentence out of the shared
-        validator's message, so this also fails if the validator is
-        reworded when the opencontext-arcgis-hub pin moves."""
+        actually do, so the plugin passes its own."""
         install_client(plugin)
         result = await run_tool(plugin, tool, args)
         assert result.success is False

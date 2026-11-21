@@ -74,10 +74,6 @@ _PARCEL_ID_HELP = (
 # honestly, in which case the caveat stays silent.
 _anchorage_coverage_pct = moa.anchorage_coverage_pct
 
-# The unknown-field hint the shared WhereValidator ends its error with. It
-# names a tool of the GIS servers; see `_validate_where_fields`.
-_HUB_SCHEMA_HINT = "Call get_layer_schema to see all available field names."
-
 # Logical -> physical field-name map for the property layer (plus the
 # two supporting layers at the bottom). THIS IS THE ONE BLOCK a forker
 # edits (or overrides per-key via the `field_map` config option) to
@@ -597,10 +593,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
     def _schema_hint(self) -> str:
         """Recovery hint for an unknown field in a WHERE clause.
 
-        The shared WhereValidator says "Call get_layer_schema", which is
-        a tool on the GIS servers, not this one -- a caller following
-        that advice here gets -32602 Unknown tool. Point at what exists
-        on this server instead.
+        The shared WhereValidator's default says "Call
+        get_layer_schema", which is a tool on the GIS servers, not this
+        one -- a caller following that advice here gets -32602 Unknown
+        tool. Point at what exists on this server instead.
         """
         return (
             f"{CASE_SENSITIVE_NOTE} The summary fields are: "
@@ -611,17 +607,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
     def _validate_where_fields(self, where: str) -> None:
         """Refuse a WHERE clause naming a field the layer does not have.
 
-        The check and its did-you-mean are the shared validator's; only
-        the closing sentence is replaced (see `_schema_hint`). A test
-        pins that the replacement happened, so a reworded validator is
-        caught when the opencontext-arcgis-hub pin moves.
+        The check and its did-you-mean are the shared validator's; the
+        closing sentence is this server's own (see `_schema_hint`).
         """
-        try:
-            WhereValidator.validate_against_schema(where, self._live_fields)
-        except ToolInputError as e:
-            raise ToolInputError(
-                str(e).replace(_HUB_SCHEMA_HINT, self._schema_hint)
-            ) from None
+        WhereValidator.validate_against_schema(
+            where, self._live_fields, schema_hint=self._schema_hint
+        )
 
     @property
     def _parcel_id_fields(self) -> List[str]:
