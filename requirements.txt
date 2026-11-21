@@ -1,9 +1,17 @@
 # The MCP server core (core/ and server/): protocol handling, HTTP handler,
 # Lambda adapter, plugin interfaces. Shared by every OpenContext deployment;
 # upgrade by moving the tag. Keep in step with pyproject.toml.
-opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.4.1
+opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.5.0
 
-httpx>=0.27.0
+# The shared ArcGIS package (arcgis_hub). This plugin is NOT built on its
+# ArcGISHubPlugin: it imports only arcgis_hub.where_validator, the WHERE /
+# order_by / out_fields validators every ArcGIS deployment shares, so a
+# fix to them arrives by moving this tag. Keep in step with pyproject.toml.
+# pyclipper, which the package declares for its plugin, is never imported
+# here and is deliberately not listed below.
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.2.3
+
+httpx>=0.28.1
 pydantic>=2.0.0
 PyYAML>=6.0
 python-json-logger>=3.1.0

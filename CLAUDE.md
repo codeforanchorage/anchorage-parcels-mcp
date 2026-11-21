@@ -25,8 +25,8 @@ python -c "from core.validators import load_and_validate_config; load_and_valida
 
 # Tests
 python -m pytest tests/ -q                                           # All tests
-python -m pytest tests/test_anchorage_gis_plugin.py -v                        # Single file
-python -m pytest tests/test_anchorage_gis_plugin.py::TestClass::test_name -v  # Single test
+python -m pytest tests/test_anchorage_parcels_plugin.py -v                        # Single file
+python -m pytest tests/test_anchorage_parcels_plugin.py::TestClass::test_name -v  # Single test
 python -m pytest tests/ --cov=plugins --cov-report=term-missing
 # No coverage threshold is configured -- the report is informational.
 
@@ -58,6 +58,10 @@ bash ./scripts/deploy.sh --environment <staging|prod> --yes
 
 **The MCP server core is a dependency, not code in this repo.** `core/` and `server/` come from the [`opencontext-core`](https://github.com/codeforanchorage/opencontext-core) package, pinned to a tag in `requirements.txt` and `pyproject.toml` (keep the two in step; `tests/test_core_dependency.py` checks). To change protocol or transport behaviour, change it there, tag a release, and move the pin here. Do not re-create `core/` or `server/` in this repo: a local copy shadows the package. `scripts/deploy.sh` installs the package next to `plugins/` in the Lambda zip, so the handler string is unchanged. To work on both at once: `pip install -e ../opencontext-core`. Run commands from the repo root, which is where the installed core looks for `plugins/`.
 
+**The shared ArcGIS code is a dependency too.** [`opencontext-arcgis-hub`](https://github.com/codeforanchorage/opencontext-arcgis-hub) (package `arcgis_hub`) is pinned the same way, in the same two files (`tests/test_hub_dependency.py` checks). This plugin is NOT an `ArcGISHubPlugin` subclass: it imports only `arcgis_hub.where_validator`, the WHERE / order_by / out_fields validators every ArcGIS deployment shares. To change them, change them there, tag, and move the pin. Do not import `arcgis_hub.plugin` here: it needs `pyclipper`, which `requirements.txt` does not list. The validator's unknown-field error ends by naming `get_layer_schema`, a tool this server does not have; `_validate_where_fields` swaps that sentence for this server's own hint.
+
+**A plugin object lives as long as its warm Lambda container** (core 1.5.0 keeps the plugin manager, the plugin and its HTTP client between invocations; `server_reuse_across_invocations: false` restores one object per request). `initialize()` runs once per container, so anything kept on `self` needs a lifetime or a reset. In `anchorage_parcels` the layer metadata (`_live_fields`, `_date_fields`, `_coverage_pct`) and the zoning spellings are re-read after `LAYER_FACTS_TTL_S`, a failed read is retried after `LAYER_FACTS_RETRY_S` and keeps what was known, and the per-call deadline is a context variable, not an attribute (`tests/test_layer_facts_lifetime.py`).
+
 **Request flow:**
 ```
 Claude (stdio) → Go client (client/) or stdio_bridge.py → HTTP POST /mcp
@@ -75,7 +79,7 @@ Claude (stdio) → Go client (client/) or stdio_bridge.py → HTTP POST /mcp
 - `server/http_handler.py` — Cloud-agnostic HTTP handler shared by Lambda and local server
 - `stdio_bridge.py` — Python stdio-to-HTTP bridge for connecting Claude Desktop/Code to the local server (alternative to Go client)
 
-**Plugins** (`plugins/`): `anchorage_parcels` (the one this fork deploys), `anchorage_gis`, plus the `ckan`, `arcgis` and `socrata` templates, which implement `DataPlugin` with `search_datasets`, `get_dataset`, `query_data`. `plugins/arcgis/where_validator.py` is shared — `anchorage_parcels`, `anchorage_gis` and `arcgis` all import its WHERE / order_by / out_fields validators, so a change there affects all three. Custom plugins go in `custom_plugins/` and are auto-discovered.
+**Plugins** (`plugins/`): `anchorage_parcels`, the one this fork deploys, and nothing else. `plugins/anchorage_parcels/moa.py` holds the two Anchorage conventions this server must share with the Anchorage GIS server (how a parcel number is read, and how much of the municipality a layer covers); they are copied from `anchorage-gis-mcp`, so a change to the rules there belongs here too. Custom plugins go in `custom_plugins/` and are auto-discovered.
 
 ## Plugin Development
 
@@ -132,7 +136,7 @@ the behaviour, change the test deliberately rather than deleting it.
   `initialize` itself is exempt from that header check, or a client naming an
   unsupported revision could never reach the handshake that would settle on a
   supported one.
-- **Modern-era rules** (spec 2026-07-28, tested in `tests/test_modern_protocol.py`):
+- **Modern-era rules** (spec 2026-07-28, tested in opencontext-core's `tests/test_modern_protocol.py`):
   `_meta.protocolVersion` and `_meta.clientCapabilities` are required (`-32602`,
   HTTP 400 when missing); a version not in `MODERN_PROTOCOL_VERSIONS` — including
   our own legacy ones — is `-32022`/400; `server/discover`, `tools/list` and
@@ -170,7 +174,7 @@ the behaviour, change the test deliberately rather than deleting it.
 
 `.github/workflows/ci.yml` runs on push to main/develop and on every PR:
 
-- **Lint & test (Python 3.11, the Lambda runtime)** — `ruff check`, `ruff format
+- **Lint & test (Python 3.14, the Lambda runtime)** — `ruff check`, `ruff format
   --check`, a config-validation step that asserts the timeout ladder still holds
   (plugin < lambda < API Gateway's hard 29s), then the full pytest suite with
   coverage. This is what enforces the conformance invariants above.

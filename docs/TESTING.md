@@ -110,9 +110,9 @@ asyncio.run(t())
 ## Unit Tests
 
 ```bash
-pip install pytest pytest-asyncio sqlparse
+pip install -r requirements-dev.txt
 pytest
-pytest tests/test_plugin_manager.py -v
+pytest tests/test_anchorage_parcels_plugin.py -v
 pytest --cov=plugins
 ```
 

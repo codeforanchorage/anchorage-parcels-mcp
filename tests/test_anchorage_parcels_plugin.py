@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
+import arcgis_hub.where_validator
 import httpx
 import pytest
 from jsonschema import Draft202012Validator
@@ -130,6 +131,9 @@ def plugin():
     p.plugin_config = AnchorageParcelsPluginConfig()
     p._live_fields = set(SNAPSHOT_FIELDS)
     p._date_fields = {"PUBDATE", "Deed_Date"}
+    # The metadata above counts as just read, so a tool call does not
+    # fetch it again (TestLayerFactsHaveALifetime covers the refresh).
+    p._layer_meta_due = float("inf")
     p._initialized = True
     return p
 
@@ -1262,10 +1266,12 @@ class TestQueryParcels:
     async def test_unknown_field_hint_names_this_servers_tools(
         self, plugin, tool, args
     ):
-        """The shared WhereValidator's default recovery hint says "Call
-        get_layer_schema" -- a tool on the Anchorage GIS server, not this
-        one. The hint here must point at something a caller of THIS
-        server can actually do."""
+        """The shared WhereValidator's recovery hint says "Call
+        get_layer_schema" -- a tool on the GIS servers, not this one. The
+        hint here must point at something a caller of THIS server can
+        actually do. The plugin swaps that sentence out of the shared
+        validator's message, so this also fails if the validator is
+        reworded when the opencontext-arcgis-hub pin moves."""
         install_client(plugin)
         result = await run_tool(plugin, tool, args)
         assert result.success is False
@@ -1998,12 +2004,15 @@ class TestStructuredOutputConformance:
 
 
 class TestLimitedCoverageBanner:
-    """The GIS server warns that this same layer covers ~48% of the muni;
-    the parcels server, where aggregate questions are likelier, did not."""
+    """A layer whose extent covers under half of the municipality carries
+    a warning on aggregate answers, worded as the GIS server words it.
+
+    The configured PropertyInformation layer is municipality-wide and
+    does not trigger it; see test_the_parcel_layer_is_not_limited."""
 
     @pytest.mark.asyncio
     async def test_banner_fires_on_aggregate_tools(self, plugin):
-        plugin._coverage_pct = 0.4846  # what the live extent computes to
+        plugin._coverage_pct = 0.4846
         install_client(
             plugin,
             routes=[
@@ -2044,10 +2053,12 @@ class TestLimitedCoverageBanner:
                 c for c in structured["caveats"] if c["code"] == "limited_coverage"
             ], f"banner fired at coverage={pct}"
 
-    def test_reuses_the_gis_coverage_maths(self, plugin):
-        """Same layer, same figure -- not a second implementation."""
-        from plugins.anchorage_gis.plugin import AnchorageGISPlugin
-
+    @pytest.mark.asyncio
+    async def test_the_parcel_layer_is_not_limited(self, plugin):
+        """The municipality-wide parcel layer scored 48% against a
+        bounding box 2.2x its size, so every aggregate answer carried a
+        false LIMITED COVERAGE warning. This is the layer's real extent
+        (measured 2026-11-18); the GIS server corrected the same box."""
         extent = {
             "xmin": -16729973.187121626,
             "ymin": 8572850.312372128,
@@ -2056,10 +2067,14 @@ class TestLimitedCoverageBanner:
             "spatialReference": {"wkid": 102100, "latestWkid": 3857},
         }
         plugin._capture_layer_meta({"extent": extent, "fields": []})
-        assert plugin._coverage_pct == AnchorageGISPlugin._anchorage_coverage_pct(
-            extent
+        assert 0.9 < plugin._coverage_pct <= 1.0
+        assert plugin._coverage_caveat() is None
+        install_client(plugin, routes=[(is_count, {"count": 1})])
+        result = await run_tool(
+            plugin, "parcel_stats", {"stat_type": "count", "stat_field": "Parcel_ID"}
         )
-        assert round(plugin._coverage_pct * 100) == 48
+        structured = assert_conforms(plugin, "parcel_stats", result)
+        assert not [c for c in structured["caveats"] if c["code"] == "limited_coverage"]
 
 
 class TestOwnerMatchModes:
@@ -2454,9 +2469,8 @@ class TestErrorClassificationDoesNotDrift:
     PLUGIN_SRC = Path(__file__).resolve().parents[1] / (
         "plugins/anchorage_parcels/plugin.py"
     )
-    VALIDATOR_SRC = Path(__file__).resolve().parents[1] / (
-        "plugins/arcgis/where_validator.py"
-    )
+    # The shared validators come from the opencontext-arcgis-hub package.
+    VALIDATOR_SRC = Path(arcgis_hub.where_validator.__file__)
 
     def test_only_the_upstream_fault_raises_a_plain_value_error(self):
         """Exactly one plain ValueError: the Feature Service returning
