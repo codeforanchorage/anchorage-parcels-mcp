@@ -292,7 +292,7 @@ cp config.yaml "$PACKAGE_DIR/"
 echo "Installing Python dependencies..."
 
 # With uv, install the exact versions in uv.lock -- the ones CI ran the
-# tests against. requirements.txt only gives lower bounds (httpx>=0.27.0),
+# tests against. requirements.txt only gives lower bounds (httpx>=0.28.1),
 # so installing from it resolved afresh on every deploy and shipped
 # library versions that nothing had tested. To take newer versions, run
 # `uv lock --upgrade`, run the tests, commit uv.lock, then deploy.
@@ -327,15 +327,18 @@ if [ -n "$UV" ]; then
 else
     echo -e "${YELLOW}⚠️  uv not found: falling back to pip and requirements.txt.${NC}"
     echo -e "${YELLOW}   Versions are NOT taken from uv.lock and may differ from CI.${NC}"
-    # opencontext-core cannot go through this install: it comes from a git
-    # tag, so pip has to BUILD it, and pip refuses to build anything while
-    # --platform/--python-version are set. It is pure Python, so it is
-    # installed in a second step with no platform flags and --no-deps;
-    # its own dependencies (pydantic, PyYAML, python-json-logger) are in
-    # requirements.txt and arrive, as Lambda-target wheels, with this step.
+    # The opencontext-* packages (opencontext-core, opencontext-arcgis-hub)
+    # cannot go through this install: they come from git tags, so pip has
+    # to BUILD them, and pip refuses to build anything while
+    # --platform/--python-version are set. They are pure Python, so they
+    # are installed in a second step with no platform flags and --no-deps;
+    # the dependencies this deployment uses (pydantic, PyYAML,
+    # python-json-logger, httpx) are in requirements.txt and arrive, as
+    # Lambda-target wheels, with this step.
     BINARY_REQS="$PACKAGE_DIR/.requirements-binary.txt"
-    CORE_REQ=$(grep -E '^opencontext-core[ @]' requirements.txt | tr -d '\r' || true)
-    grep -vE '^opencontext-core[ @]' requirements.txt > "$BINARY_REQS"
+    GIT_REQS="$PACKAGE_DIR/.requirements-git.txt"
+    grep -E '^opencontext-[a-z-]+[ @]' requirements.txt | tr -d '\r' > "$GIT_REQS" || true
+    grep -vE '^opencontext-[a-z-]+[ @]' requirements.txt > "$BINARY_REQS"
     if ! pip install -r "$BINARY_REQS" -t "$PACKAGE_DIR/" \
         --platform manylinux2014_x86_64 \
         --implementation cp \
@@ -347,20 +350,23 @@ else
         exit 1
     fi
     rm -f "$BINARY_REQS"
-    if [ -n "$CORE_REQ" ]; then
-        if ! pip install "$CORE_REQ" -t "$PACKAGE_DIR/" \
+    if [ -s "$GIT_REQS" ]; then
+        if ! pip install -r "$GIT_REQS" -t "$PACKAGE_DIR/" \
             --no-deps --no-compile; then
-            echo -e "${RED}Error: Failed to install opencontext-core${NC}"
+            echo -e "${RED}Error: Failed to install the opencontext-* packages${NC}"
             exit 1
         fi
     fi
+    rm -f "$GIT_REQS"
 fi
 
 # The handler string is server.adapters.aws_lambda.lambda_handler, so a
-# package without these files is a Lambda that cannot start.
-for required in core/mcp_server.py server/adapters/aws_lambda.py; do
+# package without these files is a Lambda that cannot start. The plugin
+# imports arcgis_hub.where_validator, so without it the one plugin cannot
+# load either.
+for required in core/mcp_server.py server/adapters/aws_lambda.py arcgis_hub/where_validator.py; do
     if [ ! -f "$PACKAGE_DIR/$required" ]; then
-        echo -e "${RED}Error: $required is missing from the package. Is opencontext-core in requirements.txt?${NC}"
+        echo -e "${RED}Error: $required is missing from the package. Are opencontext-core and opencontext-arcgis-hub in requirements.txt?${NC}"
         exit 1
     fi
 done

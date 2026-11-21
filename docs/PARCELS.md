@@ -109,7 +109,7 @@ URL) so the drift check guards *your* schema. If your layer has no
 `category='All'` (or edit `CATEGORY_VALUES` in the same file). The
 parcel-ID normalizer assumes the MOA 8+3-digit format; cities with a
 different parcel-number shape should adapt
-`_normalize_parcel_variants` (shared with the `anchorage_gis` plugin).
+`normalize_parcel_variants` in `plugins/anchorage_parcels/moa.py`.
 
 ## Deploying to AWS Lambda (steps left for a human)
 

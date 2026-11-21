@@ -1,5 +1,13 @@
 # Security Model — Anchorage GIS MCP
 
+> This document was inherited from the Anchorage GIS deployment and
+> describes that server. The GIS plugin it refers to is no longer in
+> this repository: it lives in `anchorage-gis-mcp`, on top of the
+> `opencontext-arcgis-hub` package. What applies here is the network
+> and request-shape section, the WHERE / `out_fields` / `order_by`
+> validation (`arcgis_hub.where_validator`), and the fact that this
+> server only ever calls the three layer URLs in its config.
+
 This document describes the threat model and the defenses currently
 enforced for the public deployment at
 `https://anchorage-gis.codeforanchorage.org/mcp`. Future contributors
@@ -90,7 +98,7 @@ surface, and must stay in sync:
 ### Input validation
 
 - **WHERE clauses** validated against a SQL-injection denylist
-  (`plugins/arcgis/where_validator.py`). Forbidden keywords include
+  (`arcgis_hub.where_validator`). Forbidden keywords include
   `INSERT/UPDATE/DELETE/DROP/UNION/EXEC/...`; forbidden substrings
   include `;`, `--`, `/*`, `0x`, `xp_`, `sp_`. Max length 2000 chars.
 - **`out_fields` and `order_by`** validated for syntax via

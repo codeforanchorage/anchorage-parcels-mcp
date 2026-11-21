@@ -37,13 +37,13 @@ from core.interfaces import (
     ToolInputError,
     ToolResult,
 )
-from plugins.anchorage_gis.plugin import AnchorageGISPlugin
-from plugins.anchorage_parcels.config_schema import AnchorageParcelsPluginConfig
-from plugins.arcgis.where_validator import (
+from arcgis_hub.where_validator import (
     OrderByValidator,
     OutFieldsValidator,
     WhereValidator,
 )
+from plugins.anchorage_parcels import moa
+from plugins.anchorage_parcels.config_schema import AnchorageParcelsPluginConfig
 
 logger = logging.getLogger(__name__)
 
@@ -54,15 +54,13 @@ _DEADLINE: contextvars.ContextVar[Optional[float]] = contextvars.ContextVar(
     "anchorage_parcels_deadline", default=None
 )
 
-# Parcel-ID normalization is shared with the Anchorage GIS plugin
-# (plugins/anchorage_gis/plugin.py). It turns any of the four MOA parcel
-# formats ('002-151-32', '00215132', '00215132000', '002-151-32-000')
-# into the full variant set for a WHERE ... IN (...) lookup. The import
-# is intentionally one-directional (parcels -> gis); anchorage_gis knows
-# nothing about this plugin.
-_normalize_parcel_variants = AnchorageGISPlugin._normalize_parcel_variants
-_parcel_base_and_sub = AnchorageGISPlugin._parcel_base_and_sub
-_parcel_digits = AnchorageGISPlugin._parcel_digits
+# Parcel-ID normalization follows the same rules as the Anchorage GIS
+# server (see moa.py). It turns any of the four MOA parcel formats
+# ('002-151-32', '00215132', '00215132000', '002-151-32-000') into the
+# full variant set for a WHERE ... IN (...) lookup.
+_normalize_parcel_variants = moa.normalize_parcel_variants
+_parcel_base_and_sub = moa.parcel_base_and_sub
+_parcel_digits = moa.parcel_digits
 
 _PARCEL_ID_HELP = (
     "Pass the parcel number on its own (5 to 11 digits, hyphens "
@@ -70,11 +68,15 @@ _PARCEL_ID_HELP = (
     "search_by_address for that."
 )
 
-# Layer-extent vs municipality-area coverage, shared with the GIS server so
-# the two report the same figure for the same layer (both wrap
-# PropertyInformation). Returns None when coverage cannot be computed
+# Layer-extent vs municipality-area coverage, computed as the GIS server
+# computes it so the two report the same figure for the same layer (both
+# wrap PropertyInformation). Returns None when coverage cannot be computed
 # honestly, in which case the caveat stays silent.
-_anchorage_coverage_pct = AnchorageGISPlugin._anchorage_coverage_pct
+_anchorage_coverage_pct = moa.anchorage_coverage_pct
+
+# The unknown-field hint the shared WhereValidator ends its error with. It
+# names a tool of the GIS servers; see `_validate_where_fields`.
+_HUB_SCHEMA_HINT = "Call get_layer_schema to see all available field names."
 
 # Logical -> physical field-name map for the property layer (plus the
 # two supporting layers at the bottom). THIS IS THE ONE BLOCK a forker
@@ -358,8 +360,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
     plugin_type = PluginType.OPEN_DATA
     plugin_version = "1.0.0"
 
-    # Retry policy for transient ArcGIS failures (ported from
-    # plugins/anchorage_gis/plugin.py `_request_json_with_retry`).
+    # Retry policy for transient ArcGIS failures (same policy as the GIS
+    # servers' `_request_json_with_retry`).
     ARCGIS_MAX_ATTEMPTS = 3
     ARCGIS_RETRY_BACKOFF_S = 0.5
 
@@ -376,7 +378,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
     POINT_QUERY_LIMIT = 20
     # Below this share of the municipality, warn that the layer does not
     # cover the whole muni. Same threshold as the GIS server.
-    COVERAGE_THRESHOLD = AnchorageGISPlugin.COVERAGE_THRESHOLD
+    COVERAGE_THRESHOLD = moa.COVERAGE_THRESHOLD
+
+    # One plugin object serves a warm Lambda container for hours
+    # (opencontext-core 1.5.0 keeps it between invocations), so what it
+    # learns about the layer needs a lifetime. The assessor republishes
+    # the layer frequently; an hour bounds how long a renamed field or a
+    # new zoning spelling goes unnoticed.
+    LAYER_FACTS_TTL_S = 3600.0
+    # After a failed read, how long before the next attempt. Without it a
+    # slow upstream would cost every tool call a second slow request.
+    LAYER_FACTS_RETRY_S = 60.0
+    # The most one tool call (or startup) waits on the layer metadata.
+    # The read is a convenience: field validation and the coverage
+    # caveat. It must not eat the budget of the query the caller asked for.
+    LAYER_META_BUDGET_S = 5.0
 
     SCHEMA_SNAPSHOT_PATH = Path(__file__).parent / "schema" / "propertyinformation.json"
 
@@ -394,6 +410,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
         self._coverage_pct: Optional[float] = None
         # Lazily-built map of de-hyphenated zoning code -> stored spellings.
         self._zoning_variants: Optional[Dict[str, List[str]]] = None
+        # time.monotonic() values after which each is read again; None
+        # means "not read yet". See LAYER_FACTS_TTL_S.
+        self._layer_meta_due: Optional[float] = None
+        self._zoning_variants_due: Optional[float] = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────
 
@@ -413,28 +433,72 @@ class AnchorageParcelsPlugin(MCPPlugin):
         self.field_map.update(self.plugin_config.field_map)
         self.client = httpx.AsyncClient(timeout=self.plugin_config.timeout)
 
-        # Reachability + schema-drift check. Failures here are logged
-        # loudly but do NOT block startup: the layer is republished
+        # Reachability + schema-drift check. A failure here is logged
+        # loudly but does NOT block startup: the layer is republished
         # frequently and a transient blip at cold start must not take
-        # the whole server down (degraded > down).
-        try:
-            meta = await self._layer_query(
-                self.plugin_config.property_layer_url, {"f": "json"}
-            )
-            self._capture_layer_meta(meta)
-            self._check_schema_drift(meta)
-        except Exception as e:
-            logger.warning(
-                "anchorage_parcels: property layer unreachable at startup; "
-                "starting anyway (queries will retry per call)",
-                extra={"error": str(e)},
-            )
+        # the whole server down (degraded > down). The read is tried
+        # again from the next tool call (`_refresh_layer_meta`).
+        await self._refresh_layer_meta()
 
         self._initialized = True
         logger.info(
             f"Anchorage Parcels plugin initialized for {self.plugin_config.city_name}"
         )
         return True
+
+    async def _refresh_layer_meta(self) -> None:
+        """Read the property layer's metadata when it is due.
+
+        Called at startup and at the top of every tool call. It used to
+        be read once, in initialize(), with no time limit and no second
+        try. That was survivable while a plugin object lived for one
+        request; kept across invocations, one failed read at cold start
+        left field validation and the coverage caveat switched off for
+        the life of the container, and a successful one was never
+        refreshed however often the layer was republished.
+
+        A failed read keeps whatever was known before and is retried
+        after LAYER_FACTS_RETRY_S.
+        """
+        now = time.monotonic()
+        first_read = self._layer_meta_due is None
+        if not first_read and now < self._layer_meta_due:
+            return
+        # Set before the request, so a failure cannot leave it due.
+        self._layer_meta_due = now + self.LAYER_FACTS_RETRY_S
+        cap = now + self.LAYER_META_BUDGET_S
+        outer = _DEADLINE.get()
+        token = _DEADLINE.set(cap if outer is None else min(outer, cap))
+        try:
+            meta = await self._layer_query(
+                self.plugin_config.property_layer_url, {"f": "json"}
+            )
+        except Exception as e:
+            logger.warning(
+                "anchorage_parcels: property layer unreachable at startup; "
+                "starting anyway (queries will retry per call)"
+                if first_read
+                else "anchorage_parcels: could not refresh the property "
+                "layer metadata; keeping what was read before",
+                extra={"error": str(e)},
+            )
+            return
+        finally:
+            _DEADLINE.reset(token)
+        if not isinstance(meta, dict) or not isinstance(meta.get("fields"), list):
+            # A 200 that is not layer metadata. Trusting it would empty
+            # the field list and switch validation off.
+            logger.warning(
+                "anchorage_parcels: property layer metadata has no field "
+                "list; keeping what was read before"
+            )
+            return
+        before = self._live_fields
+        self._capture_layer_meta(meta)
+        if self._live_fields != before:
+            # Once per change, not once per refresh.
+            self._check_schema_drift(meta)
+        self._layer_meta_due = time.monotonic() + self.LAYER_FACTS_TTL_S
 
     def _capture_layer_meta(self, meta: Dict[str, Any]) -> None:
         self._coverage_pct = _anchorage_coverage_pct(meta.get("extent"))
@@ -528,16 +592,31 @@ class AnchorageParcelsPlugin(MCPPlugin):
     def _schema_hint(self) -> str:
         """Recovery hint for an unknown field in a WHERE clause.
 
-        The shared WhereValidator defaults to "Call get_layer_schema",
-        which is a tool on the Anchorage GIS server, not this one -- a
-        caller following that advice here gets -32602 Unknown tool. Point
-        at what exists on this server instead.
+        The shared WhereValidator says "Call get_layer_schema", which is
+        a tool on the GIS servers, not this one -- a caller following
+        that advice here gets -32602 Unknown tool. Point at what exists
+        on this server instead.
         """
         return (
             f"{CASE_SENSITIVE_NOTE} The summary fields are: "
             f"{self._summary_fields}. Use query_parcels with "
             f"out_fields='*' and limit=1 to see every field."
         )
+
+    def _validate_where_fields(self, where: str) -> None:
+        """Refuse a WHERE clause naming a field the layer does not have.
+
+        The check and its did-you-mean are the shared validator's; only
+        the closing sentence is replaced (see `_schema_hint`). A test
+        pins that the replacement happened, so a reworded validator is
+        caught when the opencontext-arcgis-hub pin moves.
+        """
+        try:
+            WhereValidator.validate_against_schema(where, self._live_fields)
+        except ToolInputError as e:
+            raise ToolInputError(
+                str(e).replace(_HUB_SCHEMA_HINT, self._schema_hint)
+            ) from None
 
     @property
     def _parcel_id_fields(self) -> List[str]:
@@ -596,12 +675,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
         This field is NOT normalized: `B2C` (680 records) and `B-2C` (1)
         are distinct stored values, likewise `CER1A`/`CE-R1A` and
         `I2`/`I-2`. A caller filtering on one spelling silently misses the
-        other. Fetched lazily and cached for the life of the container,
-        so queries that never mention zoning pay nothing, and a failure
-        degrades to "no expansion" rather than breaking the query.
+        other. Fetched lazily, so queries that never mention zoning pay
+        nothing, and kept for LAYER_FACTS_TTL_S. A failure degrades to
+        the previous map, or to "no expansion", rather than breaking the
+        query -- and is tried again after LAYER_FACTS_RETRY_S. It used to
+        be remembered as "this layer has no variants" for as long as the
+        container lived.
         """
-        if self._zoning_variants is not None:
-            return self._zoning_variants
+        now = time.monotonic()
+        if self._zoning_variants_due is not None and now < self._zoning_variants_due:
+            return self._zoning_variants or {}
         variants: Dict[str, List[str]] = {}
         field = self._f("zoning")
         try:
@@ -625,8 +708,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
         except Exception:
             # Never let this optional convenience break a real query.
             logger.warning("Could not fetch %s variants; skipping expansion", field)
-            variants = {}
+            self._zoning_variants_due = now + self.LAYER_FACTS_RETRY_S
+            return self._zoning_variants or {}
         self._zoning_variants = variants
+        self._zoning_variants_due = now + self.LAYER_FACTS_TTL_S
         return variants
 
     async def _expand_zoning_variants(self, where: str, caveats: "_Caveats") -> str:
@@ -771,8 +856,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
     @staticmethod
     def _arcgis_error_text(err: Any) -> str:
-        """Non-empty message from an ArcGIS error object (ported from
-        plugins/anchorage_gis/plugin.py)."""
+        """Non-empty message from an ArcGIS error object."""
         if not isinstance(err, dict):
             return str(err) or "unknown ArcGIS error"
         parts: List[str] = []
@@ -802,11 +886,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
     async def _layer_query(self, url: str, params: Dict[str, Any]) -> Dict[str, Any]:
         """GET a layer endpoint, retrying transient upstream failures.
 
-        Ported from plugins/anchorage_gis/plugin.py
-        `_request_json_with_retry`: retries httpx transport/timeout
-        errors, HTTP 5xx, and transient ArcGIS error bodies; raises
-        immediately (with a rewritten, actionable message) on real
-        errors.
+        Retries httpx transport/timeout errors, HTTP 5xx, and transient
+        ArcGIS error bodies; raises immediately (with a rewritten,
+        actionable message) on real errors. The transport retry is also
+        what recovers a pooled connection that went stale while the
+        Lambda container was frozen between invocations.
 
         Inside a tool call every attempt draws on ONE time budget (see
         `execute_tool`). The retries used to get a full HTTP timeout
@@ -895,8 +979,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
     ) -> str:
         """Turn raw ArcGIS REST errors into actionable instructions.
 
-        Same pattern as plugins/anchorage_gis/plugin.py
-        `_rewrite_arcgis_error`, adapted to this plugin's fixed layer:
+        Same pattern as the GIS servers' `_rewrite_arcgis_error`,
+        adapted to this plugin's fixed layer:
         there is no get_layer_schema tool here, so recovery hints name
         the closest real field (difflib) and point at out_fields='*'.
         """
@@ -1031,7 +1115,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 break
         return records[:limit], exceeded
 
-    # ── Formatting (conventions from plugins/anchorage_gis/plugin.py) ──
+    # ── Formatting (same conventions as the GIS servers) ──────────────
 
     @staticmethod
     def _with_retrieved_footer(text: str) -> str:
@@ -2253,9 +2337,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         if not raw_where:
             raise ToolInputError("where is required (use '1=1' to match everything)")
         where = WhereValidator.validate(raw_where)
-        WhereValidator.validate_against_schema(
-            where, self._live_fields, schema_hint=self._schema_hint
-        )
+        self._validate_where_fields(where)
         out_fields = self._validate_out_fields(args.get("out_fields"))
         order_by = OrderByValidator.validate(str(args.get("order_by") or ""))
         limit, clamp_note = self._clamp_limit(args, default=100, maximum=self.MAX_LIMIT)
@@ -2383,9 +2465,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             group_by = self._check_field_exists(group_by, "group_by")
         raw_where = str(args.get("where") or "").strip()
         where = WhereValidator.validate(raw_where or "1=1")
-        WhereValidator.validate_against_schema(
-            where, self._live_fields, schema_hint=self._schema_hint
-        )
+        self._validate_where_fields(where)
         category_clause = self._category_clause(args.get("category"))
         include_unassessed = bool(args.get("include_unassessed", False))
         caveats = _Caveats()
@@ -3216,6 +3296,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         budget = self.plugin_config.timeout if self.plugin_config else None
         deadline_token = _DEADLINE.set(time.monotonic() + budget if budget else None)
         try:
+            await self._refresh_layer_meta()
             output = await handler(arguments)
             return ToolResult(
                 content=[
