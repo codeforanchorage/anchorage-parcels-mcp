@@ -33,24 +33,8 @@ organization: "Your Organization Name" # e.g., "City of Boston"
 # For additional MCP servers, fork this repository again
 #
 plugins:
-  # Built-in: CKAN (for CKAN-based open data portals)
-  # Examples: data.boston.gov, data.gov, data.gov.uk
-  ckan:
-    enabled: false # Set to true to use
-    base_url: "https://data.example.gov/" # CKAN API base URL
-    portal_url: "https://data.example.gov/" # Public portal URL
-    city_name: "Your City" # City/organization name
-    timeout: 120 # HTTP timeout in seconds
-    # api_key: "${CKAN_API_KEY}"  # Optional: CKAN API key for authenticated requests
-
-  # Built-in: ArcGIS Hub (for ArcGIS Hub open data portals)
-  # Examples: hub.arcgis.com, data-boston.hub.arcgis.com
-  arcgis:
-    enabled: false # Set to true to use
-    portal_url: "https://hub.arcgis.com"
-    city_name: "Your City"
-    timeout: 120
-    # token: "${ARCGIS_TOKEN}"  # Optional: Bearer token for private items
+  # The generic CKAN, ArcGIS Hub and Socrata plugins are not in this
+  # repository; they are upstream (CityOfBoston/OpenContext).
 
   # Built-in: Anchorage Parcels (Municipality of Anchorage
   # property/assessment records; forkable to any city whose assessor

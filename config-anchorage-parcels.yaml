@@ -80,19 +80,6 @@ plugins:
     # Lambda to abort, format the error and return it.
     timeout: 20
 
-  ckan:
-    enabled: false
-    base_url: "https://data.example.gov/"
-    portal_url: "https://data.example.gov/"
-    city_name: "Example"
-    timeout: 120
-
-  arcgis:
-    enabled: false
-    portal_url: "https://hub.arcgis.com"
-    city_name: "Example"
-    timeout: 120
-
 aws:
   region: "us-west-2"
   lambda_name: "anchorage-parcels-mcp-staging"
