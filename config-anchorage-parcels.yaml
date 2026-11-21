@@ -34,6 +34,12 @@ instructions: |
                  group_by='Zoning_District')
   (percentile_cont with percentile=0.5 is the median; count/sum/avg/
   min/max/stddev/var are also available.)
+  Rankings ("which owners hold the most parcels") are the same call
+  with order_by='value_desc' and a limit:
+    parcel_stats(stat_type='count', stat_field='Parcel_ID',
+                 group_by='Owner_Name', order_by='value_desc', limit=10)
+  Without order_by, groups come back in group_by order, which for a
+  field with many values (owners, addresses) is NOT a ranking.
 
   Data notes: owner names and addresses are stored UPPERCASE (the search
   tools handle this); records are split by GIS_Category into 'Parcel',

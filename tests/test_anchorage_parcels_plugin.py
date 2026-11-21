@@ -668,7 +668,8 @@ class TestFindParcel:
         await run_tool(plugin, "find_parcel", {"parcel_id": "Parcel 002-151-32-999"})
         where = calls[-1][1]["where"]
         assert "Parcel_ID LIKE '%215132%'" in where
-        assert "LIKE '%2-151-32%'" in where
+        # Parcel_ID stores no hyphens: the hyphenated form is not searched.
+        assert "2-151-32" not in where
         assert "999" not in where
         assert calls[-1][1]["orderByFields"] == "Parcel_ID"
 
