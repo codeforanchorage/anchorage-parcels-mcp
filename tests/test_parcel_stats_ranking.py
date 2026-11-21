@@ -162,7 +162,8 @@ class TestPaging:
         assert structured["summary"]["truncated"] is False
         assert structured["summary"]["next_offset"] is None
         assert structured["summary"]["total_group_count"] == 133
-        assert codes(structured) == []
+        # Nothing about truncation; the owner-spelling note is separate.
+        assert codes(structured) == ["owner_names_not_normalized"]
 
     @pytest.mark.asyncio
     async def test_an_offset_past_the_end_is_not_no_matching_records(self, plugin):

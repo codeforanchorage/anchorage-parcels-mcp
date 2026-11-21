@@ -193,6 +193,8 @@ CAVEAT_CODES = (
     "base_number_match",  # the sub-parcel asked for does not exist
     "multiple_records",  # the ID resolves to several records (condos)
     "multipart_parcel",  # one record drawn as several polygons; shown once
+    "unassessed_record",  # the number names geometry with no assessment data
+    "owner_names_not_normalized",  # groups are spellings, not entities
     "address_point_fallback",  # resolved via address layer + point-in-polygon
     "no_address_match",  # neither situs nor address-point matched
     "point_outside_parcels",  # the point falls in no property polygon
@@ -1556,16 +1558,18 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
         # Zero exact hits -> near misses, clearly labelled as fuzzy.
         #
-        # The search is for the 8-digit BASE the lookup itself used, in
-        # compact and hyphenated form. It used to take the first six
-        # digits of whatever was typed, text and all; fetch five rows in
-        # no order, so one condo complex could fill the list; and treat
-        # a failed search as "no candidates", which reads as "no such
-        # parcel".
+        # The search is for the 8-digit BASE the lookup itself used. It
+        # used to take the first six digits of whatever was typed, text
+        # and all; fetch five rows in no order, so one condo complex
+        # could fill the list; and treat a failed search as "no
+        # candidates", which reads as "no such parcel".
+        #
+        # Parcel_ID is stored without hyphens, so the digits alone are
+        # the whole search. A second clause used to look for the
+        # hyphenated form in the same column, where it can never occur.
         id_field = self._f("parcel_id")
         base8 = (_parcel_base_and_sub(parcel_id) or ("",))[0]
         compact = base8.lstrip("0")
-        hyphenated = f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}".lstrip("0-")
         candidates: List[Dict[str, Any]] = []
         more_candidates = False
         search_failed = ""
@@ -1573,7 +1577,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # from them means anything.
         if len(compact) >= 4:
             like_where = self._combine_where(
-                f"({id_field} LIKE '%{compact}%' OR {id_field} LIKE '%{hyphenated}%')",
+                f"{id_field} LIKE '%{compact}%'",
                 category_clause,
             )
             try:
@@ -1689,9 +1693,18 @@ class AnchorageParcelsPlugin(MCPPlugin):
         category_clause = (
             self._category_clause(category) if category not in (None, "") else None
         )
-        where = self._combine_where(where, category_clause)
+        # Geometry-only records (no assessment join: an empty Parcel_ID
+        # and nothing else) are left out, as every other tool leaves them
+        # out. About 90 parcel numbers carry one beside a real record,
+        # and the lookup then asked "which record?" offering a candidate
+        # with an empty ID that could not be passed back -- when there
+        # was only one record with anything in it. They are looked at
+        # only when the number names nothing else (below).
+        assessed = self._assessed_clause(False)
+        number_where = self._combine_where(where, category_clause)
+        where = self._combine_where(where, category_clause, assessed)
         if base_where:
-            base_where = self._combine_where(base_where, category_clause)
+            base_where = self._combine_where(base_where, category_clause, assessed)
 
         caveats = _Caveats()
         query = {
@@ -1703,6 +1716,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
 
         records, _ = await self._query_property_layer(where, "*", 2)
         base_note = None
+        shell_count = 0
+        if not records:
+            # Before falling back to the base number: the number may be
+            # that of a geometry-only record. Answering "no such record,
+            # here is its neighbour" would be wrong; it exists.
+            records, _ = await self._query_property_layer(number_where, "*", 2)
+            if records:
+                shell_count = len(records)
+                if shell_count > 1:
+                    shell_count = await self._fetch_count(number_where) or shell_count
+                where = number_where
+                query["where"] = where
+                records = records[:1]
         if not records and base_where:
             records, _ = await self._query_property_layer(base_where, "*", 2)
             if records:
@@ -1741,7 +1767,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # Set only when rows came back for the base number instead of
         # the sub-parcel asked for; a miss above needs no such note.
         caveats.add("base_number_match", base_note)
-        match_count, is_lower_bound = 1, False
+        if shell_count:
+            polygons = f" ({shell_count} polygons carry it)" if shell_count > 1 else ""
+            base8 = _parcel_base_and_sub(parcel_id)[0]
+            base_formatted = f"{base8[0:3]}-{base8[3:6]}-{base8[6:8]}"
+            caveats.add(
+                "unassessed_record",
+                f"**NO ASSESSMENT RECORD:** `{parcel_id}` is on the layer as "
+                f"geometry only{polygons}. No owner, address, valuation or "
+                f"legal description is joined to it, which is why the "
+                f"fields below are empty: the lookup worked, the assessment "
+                f"roll has nothing under this number. Other records can "
+                f"share its base number: try find_parcel('{base_formatted}', "
+                f"category='All').",
+            )
+        match_count, is_lower_bound = max(1, shell_count), False
         full_record = records[0]
         same_record = False
         categories: List[str] = []
@@ -2599,6 +2639,19 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"read from this list alone is incomplete.",
             )
 
+        if rows and group_by == self._f("owner_name"):
+            caveats.add(
+                "owner_names_not_normalized",
+                f"**OWNER NAMES ARE NOT NORMALIZED:** each distinct spelling "
+                f"of {group_by} is its own group, so this ranks or lists "
+                f"SPELLINGS, not owners. One owner can be split across "
+                f"several: the Municipality is filed under separate "
+                f"department names, and a care-of line is part of the name "
+                f"('STATE OF ALASKA  % ...'). Read a group's figure as a "
+                f"floor for that owner, and add up its other spellings "
+                f"(search_by_owner finds them) before quoting a total or "
+                f"calling anyone the largest owner.",
+            )
         stat_label = stat_type
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
