@@ -9,7 +9,7 @@ opencontext-core @ git+https://github.com/codeforanchorage/opencontext-core@v1.5
 # fix to them arrives by moving this tag. Keep in step with pyproject.toml.
 # pyclipper, which the package declares for its plugin, is never imported
 # here and is deliberately not listed below.
-opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.2.3
+opencontext-arcgis-hub @ git+https://github.com/codeforanchorage/opencontext-arcgis-hub@v1.2.4
 
 httpx>=0.28.1
 pydantic>=2.0.0
