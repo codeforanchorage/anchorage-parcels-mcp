@@ -187,6 +187,7 @@ CAVEAT_CODES = (
     "no_fuzzy_candidates",  # not even a fuzzy fallback hit
     "fuzzy_search_failed",  # the fallback search errored: NOT "no parcel"
     "base_number_match",  # the sub-parcel asked for does not exist
+    "other_category_match",  # found, but not in the category searched
     "multiple_records",  # the ID resolves to several records (condos)
     "multipart_parcel",  # one record drawn as several polygons; shown once
     "unassessed_record",  # the number names geometry with no assessment data
@@ -1485,16 +1486,51 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "variants_tried": variants,
         }
 
-        records, exceeded = await self._query_property_layer(where, out_fields, limit)
-        base_note = None
-        if not records and base_where:
-            where = self._combine_where(base_where, category_clause)
+        # The number as given, in the category asked for; then the same
+        # number in ANY category; only then the base-number fallback, in
+        # the same two steps. A Lease or Economic record carries its own
+        # number, and the default category is 'Parcel': without the second
+        # step `01030203001` (a Lease) read as "no such parcel" to a
+        # caller who had the right number and never named a category.
+        attempts = [(number_where, category_clause, None)]
+        if category_clause:
+            attempts.append((number_where, None, None))
+        if base_where:
+            attempts.append((base_where, category_clause, fallback_note))
+            if category_clause:
+                attempts.append((base_where, None, fallback_note))
+        records, exceeded, base_note, widened = [], False, None, False
+        for number_clause, category_part, note in attempts:
+            where = self._combine_where(number_clause, category_part)
             records, exceeded = await self._query_property_layer(
                 where, out_fields, limit
             )
             if records:
-                base_note = fallback_note
+                base_note = note
+                widened = bool(category_clause) and category_part is None
                 query["where"] = where
+                break
+        if records and widened:
+            searched = str(args.get("category") or "Parcel").strip().title()
+            cat_field = self._f("category")
+            found_in = sorted(
+                {str(r[cat_field]) for r in records if r.get(cat_field) is not None}
+            )
+            caveats.add(
+                "other_category_match",
+                f"**NOT A '{searched}' RECORD:** nothing under category "
+                f"'{searched}' has this number"
+                + ("" if args.get("category") else " (the default category)")
+                + ". What follows was found under "
+                + (
+                    " / ".join(f"'{c}'" for c in found_in)
+                    if found_in
+                    else "another category"
+                )
+                + ". 'Lease' is leased government land and 'Economic' is a "
+                "multi-parcel economic unit, not a regular taxable parcel. "
+                "Pass that category to get_parcel_details.",
+            )
         if records:
             # A base number can name a whole condominium: without a count
             # the first `limit` units read as the complete answer.
@@ -2214,7 +2250,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "Address point found but no usable geometry returned; "
                 "retry, or use parcels_at_point with known coordinates."
             )
-        pip_records = await self._parcels_intersecting_point(lat, lon, assessed_clause)
+        pip_records, pip_total = await self._parcels_intersecting_point(
+            lat, lon, assessed_clause
+        )
+        pip_truncated = bool(pip_records) and self._point_truncation_caveat(
+            caveats, len(pip_records), pip_total
+        )
         caveats.add(
             "address_point_fallback",
             f"No direct {situs_field} match; resolved via the "
@@ -2225,10 +2266,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         summary = {
             "returned_count": len(pip_records),
             # The point lookup is capped; a full page may not be all of it.
-            "total_count": (
-                len(pip_records) if len(pip_records) < self.POINT_QUERY_LIMIT else None
-            ),
-            "truncated": False,
+            "total_count": pip_total,
+            "truncated": pip_truncated,
             "match_method": "address_point",
             "matched_address_point": matched_addr,
             "address_point": {"lon": lon, "lat": lat},
@@ -2276,23 +2315,73 @@ class AnchorageParcelsPlugin(MCPPlugin):
         lat: float,
         lon: float,
         assessed_clause: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """Point-in-polygon on the property layer, all categories."""
+    ) -> Tuple[List[Dict[str, Any]], Optional[int]]:
+        """Point-in-polygon on the property layer, all categories.
+
+        Returns (records, total). At most POINT_QUERY_LIMIT records come
+        back; total is how many polygons contain the point, counted
+        separately when the page is full (a condominium stacks one
+        polygon per unit: 207 at one complex). None means the page was
+        full and the count could not be fetched, so more MAY exist.
+        """
+        spatial = {
+            "f": "json",
+            "where": self._combine_where(assessed_clause),
+            "geometry": f"{lon},{lat}",
+            "geometryType": "esriGeometryPoint",
+            "inSR": "4326",
+            "spatialRel": "esriSpatialRelIntersects",
+        }
+        url = f"{self.plugin_config.property_layer_url}/query"
         data = await self._layer_query(
-            f"{self.plugin_config.property_layer_url}/query",
+            url,
             {
-                "f": "json",
-                "where": self._combine_where(assessed_clause),
+                **spatial,
                 "outFields": self._summary_fields,
-                "geometry": f"{lon},{lat}",
-                "geometryType": "esriGeometryPoint",
-                "inSR": "4326",
-                "spatialRel": "esriSpatialRelIntersects",
                 "returnGeometry": "false",
                 "resultRecordCount": str(self.POINT_QUERY_LIMIT),
             },
         )
-        return [f.get("attributes") or {} for f in data.get("features") or []]
+        records = [f.get("attributes") or {} for f in data.get("features") or []]
+        if len(records) < self.POINT_QUERY_LIMIT and not data.get(
+            "exceededTransferLimit"
+        ):
+            return records, len(records)
+        try:
+            counted = await self._layer_query(
+                url, {**spatial, "returnCountOnly": "true"}
+            )
+            total = counted.get("count")
+        except Exception as e:
+            logger.warning("point count query failed: %s", type(e).__name__)
+            total = None
+        return records, total if isinstance(total, int) else None
+
+    def _point_truncation_caveat(
+        self, caveats: "_Caveats", shown: int, total: Optional[int]
+    ) -> bool:
+        """Record that a point lookup returned only part of what is
+        there. Returns whether it did."""
+        if total is not None and total <= shown:
+            return False
+        how_many = (
+            f"{shown} of {total:,} records"
+            if total is not None
+            else f"the first {shown} records; MORE EXIST, but the total "
+            f"could not be counted"
+        )
+        caveats.add_first(
+            "results_truncated",
+            f"**TRUNCATED:** returned {how_many} whose polygon contains "
+            f"this point (limit={self.POINT_QUERY_LIMIT}). This is usually "
+            f"a condominium or other stacked ownership: one polygon per "
+            f"unit on the same ground. The records below are a SAMPLE -- "
+            f"do not treat them as every record here, and do not count "
+            f"categories from them. For the full list, take the base "
+            f"parcel number from a record below and call find_parcel or "
+            f"query_parcels with it.",
+        )
+        return True
 
     async def _parcels_at_point(self, args: Dict[str, Any]) -> _ToolOutput:
         try:
@@ -2311,7 +2400,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             )
         include_unassessed = bool(args.get("include_unassessed", False))
         assessed_clause = self._assessed_clause(include_unassessed)
-        records = await self._parcels_intersecting_point(lat, lon, assessed_clause)
+        records, total = await self._parcels_intersecting_point(
+            lat, lon, assessed_clause
+        )
         caveats = _Caveats()
         caveats.add("unassessed_included", self._unassessed_caveat(include_unassessed))
         query = {
@@ -2339,7 +2430,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 "\n".join(lines),
                 self._envelope(
                     query,
-                    {"returned_count": 0, "by_category": {}},
+                    {
+                        "returned_count": 0,
+                        "total_count": 0,
+                        "truncated": False,
+                        "by_category": {},
+                    },
                     caveats,
                     rows=[],
                 ),
@@ -2348,13 +2444,17 @@ class AnchorageParcelsPlugin(MCPPlugin):
         counts: Dict[str, int] = {}
         for r in records:
             counts[str(r.get(cat_field))] = counts.get(str(r.get(cat_field)), 0) + 1
-        lines.append(
-            f"## {len(records)} record(s) contain point (lat={lat}, lon={lon})"
-        )
+        truncated = self._point_truncation_caveat(caveats, len(records), total)
+        shown = f"{len(records)}"
+        if truncated:
+            shown += f" of {total:,}" if total is not None else " (of more)"
+        lines.append(f"## {shown} record(s) contain point (lat={lat}, lon={lon})")
         caveats.add(
             "stacked_categories",
             "Parcel, Lease, and Economic polygons can STACK at one "
-            "point -- each hit is labeled with its category. By category: "
+            "point -- each hit is labeled with its category. By category"
+            + (" (of the records SHOWN, not of all)" if truncated else "")
+            + ": "
             + ", ".join(f"{k}={n}" for k, n in sorted(counts.items())),
         )
         self._render_caveats(lines, caveats)
@@ -2368,7 +2468,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "\n".join(lines),
             self._envelope(
                 query,
-                {"returned_count": len(records), "by_category": counts},
+                {
+                    "returned_count": len(records),
+                    "total_count": total,
+                    "truncated": truncated,
+                    "by_category": counts,
+                },
                 caveats,
                 rows=records,
             ),
@@ -3005,9 +3110,26 @@ class AnchorageParcelsPlugin(MCPPlugin):
             },
             {
                 "returned_count": {"type": "integer"},
+                "total_count": {
+                    "type": ["integer", "null"],
+                    "description": (
+                        "How many records' polygons contain the point. "
+                        "null: the page was full and the count could not "
+                        "be fetched."
+                    ),
+                },
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when `rows` is only part of what is at the "
+                        "point (the lookup returns at most 20)."
+                    ),
+                },
                 "by_category": {
                     "type": "object",
-                    "description": "Record count per GIS_Category.",
+                    "description": (
+                        "Record count per GIS_Category, of the rows returned."
+                    ),
                     "additionalProperties": {"type": "integer"},
                 },
             },
