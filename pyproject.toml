@@ -1,9 +1,11 @@
 [project]
-name = "opencontext"
+name = "anchorage-parcels-mcp"
 version = "1.0.0"
-description = "Extensible MCP framework template for civic data platforms"
+description = "Read-only MCP server over Municipality of Anchorage property and assessment records"
+# Built on OpenContext by Srihari Raman, City of Boston Department of
+# Innovation and Technology (see README.md and LICENSE).
 authors = [
-    {name = "Srihari Raman", email = "srihari.raman@boston.gov"}
+    {name = "Code for Anchorage"}
 ]
 license = {text = "MIT"}
 readme = "README.md"
@@ -37,9 +39,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/thealphacubicle/OpenContext"
-Documentation = "https://github.com/thealphacubicle/OpenContext/blob/main/README.md"
-Repository = "https://github.com/thealphacubicle/OpenContext"
+Homepage = "https://github.com/codeforanchorage/anchorage-parcels-mcp"
+Documentation = "https://github.com/codeforanchorage/anchorage-parcels-mcp/blob/main/docs/PARCELS.md"
+Repository = "https://github.com/codeforanchorage/anchorage-parcels-mcp"
+Issues = "https://github.com/codeforanchorage/anchorage-parcels-mcp/issues"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

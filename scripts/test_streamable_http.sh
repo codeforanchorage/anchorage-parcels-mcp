@@ -12,12 +12,11 @@ if ! command -v jq &> /dev/null; then
 fi
 
 BASE_URL="${1:-http://localhost:8000/mcp}"
-# Optional: tool to call in step 3 and its JSON arguments. Defaults keep
-# the original CKAN behavior; pass e.g.:
+# Optional: tool to call in step 3 and its JSON arguments, e.g.:
 #   ./scripts/test_streamable_http.sh http://localhost:8000/mcp \
-#     anchorage_parcels__find_parcel '{"parcel_id": "002-151-32"}'
-DEFAULT_TOOL_ARGS='{"query": "traffic", "limit": 5}'
-TOOL_NAME="${2:-ckan__search_datasets}"
+#     anchorage_parcels__search_by_owner '{"name": "eklutna"}'
+DEFAULT_TOOL_ARGS='{"parcel_id": "002-151-32"}'
+TOOL_NAME="${2:-anchorage_parcels__find_parcel}"
 TOOL_ARGS="${3:-$DEFAULT_TOOL_ARGS}"
 
 echo "=========================================="

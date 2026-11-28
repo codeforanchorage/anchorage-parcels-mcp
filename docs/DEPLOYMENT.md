@@ -1,123 +1,131 @@
-# Deployment Guide
+# Deployment
 
-Deploy OpenContext to AWS Lambda. See [Getting Started](GETTING_STARTED.md) for the quick path.
+The server runs on AWS Lambda (Python 3.14) behind a REST API Gateway,
+in us-west-2, deployed with Terraform by `scripts/deploy.sh`.
+
+| Environment | Terraform workspace | Lambda | URL |
+| ----------- | ------------------- | ------ | --- |
+| staging | `anchorage-parcels-staging` | `anchorage-parcels-mcp-staging` | the `api_gateway_url` output |
+| prod | `anchorage-parcels-prod` | `anchorage-parcels-mcp-prod` | `https://anchorage-parcels.codeforanchorage.org/mcp` |
 
 ## Prerequisites
 
-- AWS account, AWS CLI configured
-- Terraform >= 1.0
-- Python 3.11+
+- AWS CLI with credentials for the account
+- Terraform 1.0 or later
+- Python 3.11 or later, and Bash (Git Bash on Windows)
+- The Terraform state backend, created once: see
+  [`terraform/bootstrap/README.md`](../terraform/bootstrap/README.md)
 
-## AWS Permissions
-
-- Lambda (create, update functions)
-- IAM (roles, policies)
-- CloudWatch Logs
-- API Gateway / Lambda Function URLs
-
-## Deployment
+## Deploy
 
 ```bash
-# Configure AWS
-aws configure
-
-# Create config from template (if needed)
-cp config-example.yaml config.yaml
-# Edit config.yaml - enable exactly ONE plugin
-
-# Deploy (validates config, packages, deploys)
-./scripts/deploy.sh
+cp config-anchorage-parcels.yaml config.yaml   # config.yaml is what gets packaged
+bash ./scripts/deploy.sh --environment staging --yes
+python scripts/smoke_http.py staging           # 56 HTTP-level checks
 ```
 
-### Manual Terraform
+Production is the same with `prod`. Deploy to staging and run the
+smoke test before deploying to prod. On Windows prefix the deploy with
+`PYTHONUTF8=1`.
 
-First-time: bootstrap the S3 backend (run once). See [terraform/bootstrap/README.md](../terraform/bootstrap/README.md):
+The script validates the config, builds the Lambda package (this
+repository's `plugins/` plus the pinned dependencies), selects the
+workspace, runs `terraform plan` and `apply`, and checks that the
+config inside the package matches the source.
 
-```bash
-cd terraform/bootstrap
-terraform init && terraform apply
-```
+| Flag | Meaning |
+| ---- | ------- |
+| `--environment`, `-e` | `staging` or `prod` (required) |
+| `--tfworkspace`, `-w` | Workspace name, if not the default above |
+| `--yes`, `-y` | Skip the interactive confirmation before apply |
+| `--allow-dirty` | Package a working tree with uncommitted changes. Emergencies only; the build is stamped as dirty |
 
-Then deploy:
+The script leaves Terraform on the workspace it last deployed. Check
+`terraform workspace show` in `terraform/aws/` before running any
+Terraform command by hand.
 
-```bash
-cd terraform/aws
-terraform init
-terraform plan -var="config_file=config.yaml"
-terraform apply
-```
+## Where a setting lives
 
-The deploy script copies `config.yaml` into `terraform/aws/` before running Terraform. For manual runs, ensure `config.yaml` exists in the project root or pass the correct path.
+This is easy to get wrong, and a mistake fails silently.
 
-## Endpoints
+| Setting | Edit it in | Notes |
+| ------- | ---------- | ----- |
+| Plugin settings (layer URLs, `timeout`), server `instructions` | `config.yaml` (and its tracked source) | Shipped inside the zip. Never appears as a Terraform diff |
+| `lambda_timeout`, `lambda_memory` | The `aws:` block of `config.yaml` | Overrides the values in `terraform/aws/*.tfvars` |
+| `lambda_name`, stage, region, throttles, concurrency, custom domain | `terraform/aws/staging.tfvars` / `prod.tfvars` | Here the tfvars file wins |
+| WAF per-IP rate limit | The mcp-stats repository (`fleet_waf_members`) | Both environments use the shared fleet ACL |
 
-| Endpoint | Use Case | Auth |
-|----------|----------|------|
-| **API Gateway** | Production | Rate limiting, daily quota |
-| **Lambda Function URL** | Testing | None |
+`terraform/aws/config.yaml` and `terraform/aws/lambda-deployment.zip`
+are build output. `deploy.sh` overwrites them, so editing them does
+nothing, and a `terraform plan` run without repackaging reads the stale
+copies.
 
-### Get URLs
+The config is read from the package (`$LAMBDA_TASK_ROOT/config.yaml`),
+not from the `OPENCONTEXT_CONFIG` environment variable, which Terraform
+sets to the empty string: the file is larger than the 4 KB AWS allows
+for environment variables. It does not support `${ENV_VAR}`
+substitution, and nothing secret belongs in it.
 
-```bash
-cd terraform/aws
-terraform output -raw api_gateway_url   # Production (includes /mcp)
-terraform output -raw lambda_url      # Testing
-```
+### Timeouts
 
-### API Gateway
+Keep this order: API Gateway's fixed 29 s > `aws.lambda_timeout` 28 s >
+the plugin's `timeout` 20 s. A plugin timeout above the Lambda's means
+a slow upstream kills the Lambda mid-request, and the caller gets a
+gateway error where a readable tool error was possible. CI checks the
+order.
 
-- **Rate limit:** 100 burst, 50 sustained req/s (configurable via Terraform variables)
-- **Daily quota:** 1000 requests/day (configurable via `api_quota_limit`)
-- **Stage name:** Default is `staging`; URL format: `https://...execute-api.region.amazonaws.com/staging/mcp`
-- **429** when exceeded
-- Use for production; Lambda URL has no auth
+## Limits in force
 
-## Configuration
+| | staging | prod |
+| - | ------- | ---- |
+| API Gateway throttle (requests/s, burst) | 5, 10 | 15, 30 |
+| Lambda reserved concurrency | 5 | 30 |
+| WAF per-IP limit per 5 minutes | 300 | 2000 |
+| Lambda memory, timeout | 512 MB, 28 s | 512 MB, 28 s |
 
-Config is passed via `OPENCONTEXT_CONFIG` env var. Create `config.yaml` from `config-example.yaml`, edit it, and run `./scripts/deploy.sh` to update.
+A throttled request gets HTTP 429. [SECURITY.md](SECURITY.md) explains
+what each limit is for.
 
-### Lambda Settings (in config.yaml)
+## Outputs and logs
 
-```yaml
-aws:
-  region: "us-east-1"
-  lambda_name: "my-mcp-server"   # Optional; defaults from server_name
-  lambda_memory: 512             # 128–10240 MB
-  lambda_timeout: 120            # 1–900 seconds
-```
-
-## Monitoring
-
-- **CloudWatch Logs:** `/aws/lambda/<function-name>`, 14-day retention
-- **Tail logs:** `aws logs tail /aws/lambda/my-mcp-server --follow`
-
-## Updating & Cleanup
-
-**Update:** Change code/config, run `./scripts/deploy.sh` again.
-
-**Destroy:**
 ```bash
 cd terraform/aws
-terraform destroy -var="config_file=config.yaml"
+terraform output -raw api_gateway_url     # includes /mcp
+terraform output cloudwatch_log_group
 ```
 
-## Cost (us-east-1)
+- Lambda logs: `/aws/lambda/<lambda name>`, kept 14 days.
+  `aws logs tail /aws/lambda/anchorage-parcels-mcp-prod --follow`
+- API Gateway access logs: the `api_gateway_access_log_group` output,
+  kept 30 days.
+- CloudWatch alarms are created only when `alarm_sns_topic_arn` is set.
 
-- Lambda: ~$0.20/1M requests, ~$0.0000166667/GB-second
-- Function URL: Free
-- Example: 100K req/month, 512 MB, 1s avg ≈ **$1/month**
+On Git Bash set `MSYS_NO_PATHCONV=1` for AWS CLI commands that take a
+log group name, or the leading `/` is rewritten as a Windows path.
+
+### Custom domain
+
+Prod sets `custom_domain` in `prod.tfvars`. DNS is managed outside AWS
+and needs two CNAME records: the certificate validation record
+(`acm_validation_cname_name` / `acm_validation_cname_value` outputs)
+and the traffic record pointing at the `custom_domain_target` output.
+
+## Deploying a fork
+
+Before the first deploy, give the fork its own `lambda_name` in both
+tfvars files and its own Terraform state bucket and workspaces.
+Otherwise the first apply will try to replace this deployment's
+Lambda. See "Fork this for your city" in [PARCELS.md](PARCELS.md) for
+the plugin side.
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| Multiple plugins | Enable only ONE in `config.yaml` |
-| Lambda timeout | Increase `lambda_timeout` |
-| 500 error | Check CloudWatch logs, validate config |
-| High cost | Reduce `lambda_memory`, review usage |
-
-## Security
-
-- Use API Gateway for production (rate limiting, quota)
-- Lambda URL is public—testing only
-- Store secrets in env vars, not code
+| Symptom | Look at |
+| ------- | ------- |
+| Deploy stops at "Multiple Plugins Enabled" or a config error | `config.yaml`: exactly one plugin enabled |
+| Deploy refuses a dirty tree | Commit first; `--allow-dirty` only in an emergency |
+| A config change did not take effect | It was edited in `terraform/aws/config.yaml`, or deployed without `deploy.sh` |
+| HTTP 403 before any tool runs | The request's `Origin` is not on the allowlist. Requests with no `Origin` are allowed |
+| HTTP 429 | A throttle or the WAF limit above |
+| HTTP 504, or a call cut off near 29 s | The timeout order above |
+| Tool errors naming a quota or 429 from ArcGIS | The upstream's per-IP limit. Wait and retry before blaming the deploy |

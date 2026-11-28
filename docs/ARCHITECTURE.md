@@ -1,164 +1,81 @@
-# OpenContext Architecture
+# Architecture
 
-## Overview
+## One fork, one server
 
-OpenContext is a plugin-based framework. Each deployment runs **one** server with **one** plugin. This keeps deployments simple, independently scalable, and easy to maintain.
+A deployment runs exactly one plugin. This repository's is
+`anchorage_parcels`. The rule is checked when the config is loaded and
+again when plugins are loaded, so a config that enables two plugins,
+or none, does not start. A second data source is a second repository
+and a second deployment.
 
-## One Fork = One Server
+## What is in this repository, and what is not
 
-**Enforcement:**
-- `scripts/deploy.sh` validates config before deployment
-- `plugin_manager.py` fails if multiple plugins are enabled
+| Piece | Where it lives |
+| ----- | -------------- |
+| The seven tools, and everything they know about the parcel layer | `plugins/anchorage_parcels/plugin.py` |
+| Parcel-number and coverage rules shared with the Anchorage GIS server | `plugins/anchorage_parcels/moa.py` |
+| Plugin settings and their defaults | `plugins/anchorage_parcels/config_schema.py` |
+| The vendored layer schema the drift check compares against | `plugins/anchorage_parcels/schema/propertyinformation.json` |
+| MCP protocol, JSON-RPC, HTTP handling, the Lambda adapter (`core/`, `server/`) | The [`opencontext-core`](https://github.com/codeforanchorage/opencontext-core) package, pinned in `requirements.txt` and `pyproject.toml` |
+| WHERE, `order_by` and `out_fields` validation | The [`opencontext-arcgis-hub`](https://github.com/codeforanchorage/opencontext-arcgis-hub) package, pinned the same way |
+| Lambda, API Gateway, WAF association, alarms | `terraform/aws/` |
 
-**Multiple servers:** Fork again per plugin, deploy each separately.
+There is no `core/` or `server/` directory here, and there must not be
+one: a local copy would shadow the installed package. To change
+protocol or transport behaviour, change it in `opencontext-core`, tag a
+release, and move the pin in both files.
 
-## Components
-
-```
-core/
-├── interfaces.py       # MCPPlugin, DataPlugin, ToolDefinition
-├── plugin_manager.py   # Discovery, loading, routing
-├── mcp_server.py       # MCP JSON-RPC handler
-├── validators.py       # Config validation
-└── logging_utils.py   # Structured logging
-
-server/
-├── adapters/
-│   └── aws_lambda.py   # Lambda handler entry point
-└── http_handler.py     # HTTP request handling
-
-plugins/                # Built-in (CKAN)
-├── ckan/
-│   ├── plugin.py
-│   ├── config_schema.py
-│   └── sql_validator.py
-
-custom_plugins/         # User plugins (auto-discovered)
-├── template/
-│   └── plugin_template.py
-
-examples/               # Example configs and plugins
-├── boston-opendata/
-└── custom-plugin/
-
-client/                 # Go stdio-to-HTTP client (optional)
-tests/                  # Unit tests
-```
-
-### Request Flow
+## Request flow
 
 ```
-Claude Desktop / App
-    → stdio bridge (npx) or Go client
-Lambda / Local Server
-    → server.adapters.aws_lambda or local_server.py
-    → MCP Server (core/mcp_server.py)
-    → Plugin Manager
-    → Plugin (e.g., CKAN)
-    → External API
+MCP client
+  → HTTPS POST /mcp
+  → API Gateway (throttling) and WAF (per-IP rate limit)
+  → Lambda: server.adapters.aws_lambda.lambda_handler
+  → server/http_handler.py   Origin allowlist, protocol-version checks
+  → core/mcp_server.py       JSON-RPC: initialize, tools/list, tools/call, ...
+  → core/plugin_manager.py   routes anchorage_parcels__<tool> to the plugin
+  → plugins/anchorage_parcels/plugin.py
+  → the Municipality's ArcGIS Feature Service
 ```
 
-## Plugins
+`scripts/local_server.py` enters the same chain at `http_handler`, so
+the Origin and protocol-version checks run locally as well. A client
+that only speaks stdio reaches the HTTP endpoint through the Go client
+in `client/` or through `stdio_bridge.py`.
 
-Each deployment enables **exactly one** plugin.
+Tool names are prefixed by the plugin manager: the plugin defines
+`find_parcel`, and clients see `anchorage_parcels__find_parcel`.
 
-### Built-in: CKAN
+## Things that shape the plugin
 
-For CKAN-based open data portals (e.g., data.boston.gov, data.gov, data.gov.uk).
+- **Nothing is cached between calls except layer facts.** Every tool
+  call queries the live layer. The plugin object lives as long as its
+  warm Lambda container, so the few things kept on it (the field list,
+  date fields, coverage, zoning spellings) are re-read after an hour.
+- **One time budget per call.** A tool call has 20 seconds for every
+  upstream request and retry it makes. That sits under the Lambda's 28
+  seconds, which sits under API Gateway's fixed 29, so a slow upstream
+  produces a readable tool error and not a dropped connection.
+- **Output schemas are binding.** Each tool declares an `outputSchema`,
+  and every return path emits conforming structured content, including
+  the empty, not-found and truncated ones.
+- **Caveats are written once.** The warnings in the text and the
+  `caveats` array in the structured output come from one list, so they
+  cannot disagree.
+- **Caller mistakes are not server errors.** A bad argument raises
+  `ToolInputError`, which reaches the caller as a tool error and is
+  logged without a traceback.
 
-**Configuration:**
-
-```yaml
-plugins:
-  ckan:
-    enabled: true
-    base_url: "https://data.yourcity.gov"
-    portal_url: "https://data.yourcity.gov"
-    city_name: "Your City"
-    timeout: 120
-    api_key: "${CKAN_API_KEY}"  # Optional
-```
-
-**Tools:**
-
-| Tool | Description |
-|------|-------------|
-| `ckan__search_datasets(query, limit)` | Search for datasets |
-| `ckan__get_dataset(dataset_id)` | Get dataset metadata |
-| `ckan__query_data(resource_id, filters, limit)` | Query data from a resource |
-| `ckan__get_schema(resource_id)` | Get schema for a resource |
-| `ckan__execute_sql(sql)` | Execute PostgreSQL SELECT queries (advanced) |
-
-**SQL execution:** The `execute_sql` tool allows complex PostgreSQL queries (CTEs, window functions, joins). Only SELECT is allowed. INSERT, UPDATE, DELETE, DROP, and other destructive operations are blocked. Resource IDs must be valid UUIDs in double quotes: `FROM "uuid-here"`. See [CKAN API docs](https://docs.ckan.org/en/latest/api/) for details.
-
-### Custom Plugins
-
-Add your own plugins in `custom_plugins/`. They are auto-discovered.
-
-**Quick start:**
-
-```bash
-mkdir -p custom_plugins/my_plugin
-cp custom_plugins/template/plugin_template.py custom_plugins/my_plugin/plugin.py
-```
-
-Edit the plugin, add config to `config.yaml` (create from `config-example.yaml` if needed), then `./scripts/deploy.sh`.
-
-**Structure:**
-- Inherit from `MCPPlugin` (or `DataPlugin` for data sources)
-- Set: `plugin_name`, `plugin_type`, `plugin_version`
-- Place in: `custom_plugins/your_plugin_name/plugin.py`
-- Tool names: no prefix—Plugin Manager adds it (e.g., `my_plugin__search`)
-
-**Required methods:**
-
-```python
-def __init__(self, config: Dict[str, Any]) -> None
-async def initialize() -> bool
-async def shutdown() -> None
-def get_tools() -> List[ToolDefinition]
-async def execute_tool(tool_name, arguments) -> ToolResult
-async def health_check() -> bool
-```
-
-**DataPlugin:** For data sources, inherit from `DataPlugin` and implement `search_datasets`, `get_dataset`, and `query_data`.
-
-**Best practices:** Return `ToolResult(success=False, error_message=...)` on failure. Use `logging.getLogger(__name__)`. Validate config in `initialize()`.
-
-**Reference:**
-- [Plugin template](../custom_plugins/template/plugin_template.py)
-- [CKAN plugin](https://github.com/CityOfBoston/OpenContext/tree/main/plugins/ckan/) – Full implementation
-- [Examples](../examples/custom-plugin/) – Custom plugin example
-
-## Plugin Interface
-
-```python
-class MCPPlugin(ABC):
-    plugin_name: str
-    plugin_type: PluginType
-    plugin_version: str
-
-    async def initialize() -> bool
-    async def shutdown() -> None
-    def get_tools() -> List[ToolDefinition]
-    async def execute_tool(tool_name, arguments) -> ToolResult
-    async def health_check() -> bool
-```
-
-## Endpoints
-
-| Endpoint | Auth | Use |
-|----------|------|-----|
-| API Gateway | Rate limit, quota | Production |
-| Lambda Function URL | None | Testing |
+The tests enforce each of these. [`CLAUDE.md`](../CLAUDE.md) has the
+full list of invariants, and [SECURITY.md](SECURITY.md) covers the
+public endpoint.
 
 ## Configuration
 
-Single `config.yaml`; passed to Lambda via `OPENCONTEXT_CONFIG`. Validated at deploy and runtime.
-
-## Security & Scalability
-
-- **API Gateway:** Rate limiting (100 burst, 50 sustained/s), configurable daily quota
-- **Lambda URL:** Public—testing only
-- **Stateless:** No shared state; Lambda auto-scales
-- **Logging:** CloudWatch, structured JSON, request IDs
+`config.yaml` in the repository root is read at startup; it is
+gitignored, and `config-anchorage-parcels.yaml` is its tracked source.
+On Lambda the file ships inside the deployment package. It does not
+support `${ENV_VAR}` substitution. See [PARCELS.md](PARCELS.md) for the
+plugin's settings and [DEPLOYMENT.md](DEPLOYMENT.md) for the `aws:`
+block.

@@ -813,7 +813,7 @@ wheels = [
 ]
 
 [[package]]
-name = "opencontext"
+name = "anchorage-parcels-mcp"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [

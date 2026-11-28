@@ -1,132 +1,88 @@
-# Testing Guide
+# Testing
 
-This guide covers three ways to test your OpenContext server locally.
+## Unit tests
 
-## Prerequisites
-
-Before testing:
-
-1. Create `config.yaml` from `config-example.yaml` and enable exactly one plugin
-2. Install dependencies: `pip install aiohttp`
-3. Start the server: `python3 scripts/local_server.py`
-
-The server runs at `http://localhost:8000/mcp`. Keep it running while you test.
-
----
-
-## Method 1: Terminal (cURL)
-
-Use the terminal to send requests directly to the server.
-
-**Ping:**
+No network, no AWS. HTTP is mocked.
 
 ```bash
-curl -X POST http://localhost:8000/mcp \
+pip install -r requirements.txt -r requirements-dev.txt
+
+python -m pytest tests/ -q
+python -m pytest tests/test_anchorage_parcels_plugin.py -v
+python -m pytest tests/ --cov=plugins --cov-report=term-missing
+
+python -m ruff check plugins/ tests/
+python -m ruff format --check plugins/ tests/
+```
+
+CI runs these on every push and pull request, with ruff pinned to
+0.15.1 (the formatter's output changes between releases). Coverage is
+reported, not enforced.
+
+Several tests are contracts, not examples: real tool output is
+validated against each declared `outputSchema`, every structured caveat
+must appear word for word in the text, and the timeout order is
+asserted. If one fails after a change, decide whether the behaviour or
+the test is wrong before touching either.
+
+New behaviour gets its own `tests/test_<topic>.py`, importing the
+helpers (`install_client`, `run_tool`, `assert_conforms`, ...) from
+`tests.test_anchorage_parcels_plugin`.
+
+## Against the live layer
+
+```bash
+python scripts/smoke_parcels.py
+```
+
+Runs the plugin in-process against the Municipality's ArcGIS service.
+It skips (exit 0) when the service is unreachable.
+
+## Against a running server
+
+Start one locally (see [GETTING_STARTED.md](GETTING_STARTED.md)), or
+use a deployed one:
+
+```bash
+python scripts/smoke_http.py http://localhost:8000/mcp
+python scripts/smoke_http.py staging
+python scripts/smoke_http.py              # prod
+```
+
+56 checks over HTTP: protocol negotiation in both eras, `tools/list`,
+every tool, the error paths and CORS preflight. Run back to back it
+can trip the upstream's per-IP quota; a failure that mentions a quota
+or 429 is that, not a regression.
+
+`scripts/smoke_prod.py` is a shorter run that keeps going after a
+failure and prints one line per check.
+
+### By hand
+
+```bash
+curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
-```
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 
-**List tools:**
-
-```bash
-curl -X POST http://localhost:8000/mcp \
+curl -s -X POST http://localhost:8000/mcp \
   -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"anchorage_parcels__find_parcel","arguments":{"parcel_id":"002-151-32"}}}'
 ```
 
-**Call a tool:**
+`scripts/test_streamable_http.sh [url]` walks initialize, `tools/list`
+and one tool call, printing each exchange. It needs `jq`.
+
+### MCP Inspector
 
 ```bash
-curl -X POST http://localhost:8000/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ckan__search_datasets","arguments":{"query":"housing","limit":3}}}'
+npx @modelcontextprotocol/inspector
 ```
 
-For a full test (initialize, list tools, call tool), run:
+Choose the Streamable HTTP transport and enter the server's `/mcp`
+URL.
 
-```bash
-./scripts/test_streamable_http.sh
-```
+### Claude
 
----
-
-## Method 2: Claude (Connectors)
-
-1. Connect via Claude Connectors (see [Getting Started](GETTING_STARTED.md))
-2. Add a custom connector with URL: `http://localhost:8000/mcp`
-3. Enable the connector in your conversation (click "+" → Connectors → toggle on)
-4. Ask Claude to search your data or list available tools
-
-**Note:** Localhost only works with Claude Desktop. For Claude.ai (web), use MCP Inspector or deploy first.
-
----
-
-## Method 3: MCP Inspector
-
-MCP Inspector is a web-based tool for testing MCP servers.
-
-1. With the server running, open a new terminal
-2. Run: `npx @modelcontextprotocol/inspector`
-3. The Inspector UI opens in your browser (typically `http://localhost:6274`)
-4. In the Inspector, select **streamable-http** as the transport
-5. Enter the URL: `http://localhost:8000/mcp`
-6. Use the Tools tab to list and call tools
-
----
-
-## Quick Checks
-
-Optional checks before starting the server.
-
-**Config validation:**
-
-```bash
-python3 -c "
-import yaml
-from core.validators import load_and_validate_config
-config = load_and_validate_config('config.yaml')
-print('Config valid:', config['server_name'])
-"
-```
-
-**Plugin loading:**
-
-```bash
-python3 -c "
-import asyncio, yaml
-from core.plugin_manager import PluginManager
-async def t():
-    with open('config.yaml') as f: config = yaml.safe_load(f)
-    pm = PluginManager(config)
-    await pm.load_plugins()
-    print('Tools:', [t['name'] for t in pm.get_all_tools()])
-    await pm.shutdown()
-asyncio.run(t())
-"
-```
-
----
-
-## Unit Tests
-
-```bash
-pip install -r requirements-dev.txt
-pytest
-pytest tests/test_anchorage_parcels_plugin.py -v
-pytest --cov=plugins
-```
-
----
-
-## Testing Against Production
-
-To test a deployed server, use the Lambda URL or API Gateway URL:
-
-```bash
-LAMBDA_URL="https://your-lambda-url.lambda-url.us-east-1.on.aws"
-curl -X POST $LAMBDA_URL/mcp \
-  -H "Content-Type: application/json" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"ping"}'
-```
-
-See [Deployment](DEPLOYMENT.md) for how to get the URL.
+Claude Desktop and Claude Code can connect to
+`http://localhost:8000/mcp`. claude.ai cannot reach localhost; use the
+staging URL.

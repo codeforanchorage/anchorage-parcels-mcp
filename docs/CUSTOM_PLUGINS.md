@@ -318,11 +318,10 @@ def __init__(self, config: Dict[str, Any]) -> None:
 ## Reference
 
 - [Plugin Template](../custom_plugins/template/plugin_template.py)
-- [CKAN Plugin](https://github.com/CityOfBoston/OpenContext/tree/main/plugins/ckan/plugin.py) - Example implementation
-- [Core Interfaces](../core/interfaces.py) - API reference
+- [The parcels plugin](../plugins/anchorage_parcels/plugin.py) - a complete implementation
+- [Core interfaces](https://github.com/codeforanchorage/opencontext-core) - `core/interfaces.py` in the `opencontext-core` package
 
 ## Getting Help
 
-- [FAQ](FAQ.md)
-- [GitHub Issues](https://github.com/thealphacubicle/OpenContext/issues)
-- [Architecture Guide](ARCHITECTURE.md)
+- [Architecture](ARCHITECTURE.md)
+- [GitHub Issues](https://github.com/codeforanchorage/anchorage-parcels-mcp/issues)
