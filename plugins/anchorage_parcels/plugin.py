@@ -722,6 +722,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
             return where
 
         folded: List[str] = []
+        # (what the caller wrote, the stored spellings used instead)
+        corrected: List[Tuple[str, List[str]]] = []
 
         def replace(m: "re.Match[str]") -> str:
             value = m.group(1)
@@ -729,11 +731,25 @@ class AnchorageParcelsPlugin(MCPPlugin):
             others = [v for v in siblings if v != value]
             if not others:
                 return m.group(0)
-            folded.extend(others)
+            if value in siblings:
+                folded.extend(others)
+            else:
+                # 'ro' for 'RO': nothing is stored under the caller's own
+                # spelling, so this is a correction, not a twin folded in.
+                corrected.append((value, sorted(siblings)))
             quoted = ",".join(self._sql_quote(v) for v in sorted(siblings))
             return f"{field} IN ({quoted})"
 
         rewritten = pattern.sub(replace, where)
+        for value, stored in corrected:
+            caveats.add(
+                "zoning_variants_matched",
+                f"**{field} VALUE ADJUSTED:** nothing is stored as "
+                f"{value!r}; matched the stored "
+                f"spelling{'s' if len(stored) > 1 else ''} "
+                f"{', '.join(repr(v) for v in stored)} instead (same code, "
+                f"different case or hyphenation).",
+            )
         if folded:
             caveats.add(
                 "zoning_variants_matched",
@@ -839,6 +855,31 @@ class AnchorageParcelsPlugin(MCPPlugin):
             raise ToolInputError(
                 f"offset must be an integer (got {raw_offset!r})."
             ) from None
+
+    @staticmethod
+    def _parse_flag(args: Dict[str, Any], name: str) -> bool:
+        """A true/false argument, read as what the caller wrote.
+
+        It used to be `bool(value)`, so the string "false" -- which a
+        client that serialises every argument as text sends -- was true,
+        and switched ON the thing it was meant to switch off. Text and
+        0/1 spellings are accepted; anything else is refused rather than
+        guessed at.
+        """
+        raw = args.get(name)
+        if raw is None:
+            return False
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str):
+            text = raw.strip().lower()
+            if text in ("true", "1", "yes"):
+                return True
+            if text in ("false", "0", "no", ""):
+                return False
+        elif isinstance(raw, (int, float)) and raw in (0, 1):
+            return bool(raw)
+        raise ToolInputError(f"{name} must be true or false (got {raw!r}).")
 
     def _check_field_exists(self, field: str, arg_name: str) -> str:
         """Validate a single field-name argument against the live schema."""
@@ -2050,7 +2091,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=20, maximum=self.MAX_LIMIT)
         category_clause = self._category_clause(args.get("category"))
         owner_field = self._f("owner_name")
-        include_unassessed = bool(args.get("include_unassessed", False))
+        include_unassessed = self._parse_flag(args, "include_unassessed")
         assessed_clause = self._assessed_clause(include_unassessed)
         match = str(args.get("match") or "contains").strip().lower()
         if match not in self.OWNER_MATCH_MODES:
@@ -2139,7 +2180,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         limit, clamp_note = self._clamp_limit(args, default=10, maximum=100)
         needle = address.upper()
         situs_field = self._f("situs_address")
-        include_unassessed = bool(args.get("include_unassessed", False))
+        include_unassessed = self._parse_flag(args, "include_unassessed")
         assessed_clause = self._assessed_clause(include_unassessed)
         where = self._combine_where(self._like(situs_field, needle), assessed_clause)
 
@@ -2398,7 +2439,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"lat must be in [-90, 90] and lon in [-180, 180]; "
                 f"Anchorage is roughly lat 61, lon -149."
             )
-        include_unassessed = bool(args.get("include_unassessed", False))
+        include_unassessed = self._parse_flag(args, "include_unassessed")
         assessed_clause = self._assessed_clause(include_unassessed)
         records, total = await self._parcels_intersecting_point(
             lat, lon, assessed_clause
@@ -2494,7 +2535,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             clamp_note += " Page with offset= for more."
         offset = self._parse_offset(args)
         category_clause = self._category_clause(args.get("category"))
-        include_unassessed = bool(args.get("include_unassessed", False))
+        include_unassessed = self._parse_flag(args, "include_unassessed")
         # Caveats are collected from here on, because the zoning expansion
         # below needs somewhere to report what it folded in.
         caveats = _Caveats()
@@ -2531,7 +2572,22 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"with offset={next_offset} (same where/order_by) for the "
                 f"next page.",
             )
-        if not records:
+        # An offset past the last record is not "nothing matches": only a
+        # count of zero says that. It used to read "No records matched
+        # the WHERE clause", with hints for fixing a clause that was
+        # fine, beside a total_count in the hundreds.
+        past_the_end = not records and bool(offset) and total != 0
+        if past_the_end:
+            only = (
+                f": only {total:,} record(s) match"
+                if total
+                else " (the number of matching records could not be counted)"
+            )
+            caveats.add(
+                "no_results",
+                f"No records at offset={offset:,}{only}. Use a smaller offset.",
+            )
+        elif not records:
             caveats.add(
                 "no_results",
                 "No records matched the WHERE clause.",
@@ -2545,7 +2601,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
             out_fields=out_fields,
             caveats=caveats,
         )
-        if not records:
+        if not records and not past_the_end:
             text += self._no_data_hint(full_where)
         return _ToolOutput(
             text,
@@ -2616,9 +2672,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # Ordering and paging apply to groups. Refused, not ignored, on
         # an ungrouped statistic: there the result is one number, and a
         # caller who passed them meant to group.
-        paging_args = [k for k in ("limit", "offset") if args.get(k) is not None]
+        #
+        # Only a value that would change something counts. The schema
+        # advertises offset=0 and limit=2000 as defaults, and a client
+        # that fills defaults in was refused for sending them.
+        limit, clamp_note = self._clamp_limit(
+            args, default=self.SERVER_PAGE_SIZE, maximum=self.SERVER_PAGE_SIZE
+        )
+        offset = self._parse_offset(args)
+        paging_args = []
         if order_by != "group":
-            paging_args.insert(0, "order_by")
+            paging_args.append("order_by")
+        if args.get("limit") is not None and limit != self.SERVER_PAGE_SIZE:
+            paging_args.append("limit")
+        if offset:
+            paging_args.append("offset")
         if paging_args and not group_by:
             raise ToolInputError(
                 f"{' / '.join(paging_args)} can only be used with a grouped "
@@ -2626,17 +2694,16 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"group_by='Owner_Name', order_by='value_desc', limit=10 for "
                 f"the ten owners with the largest value)."
             )
-        limit, clamp_note = self._clamp_limit(
-            args, default=self.SERVER_PAGE_SIZE, maximum=self.SERVER_PAGE_SIZE
-        )
+        if not group_by:
+            # Nothing is paged, so there is nothing to have clamped.
+            clamp_note = None
         if clamp_note:
             clamp_note += " Page with offset= for more."
-        offset = self._parse_offset(args)
         raw_where = str(args.get("where") or "").strip()
         where = WhereValidator.validate(raw_where or "1=1")
         self._validate_where_fields(where)
         category_clause = self._category_clause(args.get("category"))
-        include_unassessed = bool(args.get("include_unassessed", False))
+        include_unassessed = self._parse_flag(args, "include_unassessed")
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
         where = await self._expand_zoning_variants(where, caveats)
