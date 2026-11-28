@@ -255,7 +255,8 @@ class TestConfigSchema:
         assert cfg.property_layer_url == DEFAULT_PROPERTY_LAYER_URL
         assert cfg.addresses_layer_url == DEFAULT_ADDRESSES_LAYER_URL
         assert cfg.city_name == "Municipality of Anchorage"
-        assert cfg.timeout == 30
+        # Under the Lambda's 28s: see the timeout ladder in CLAUDE.md.
+        assert cfg.timeout == 20
         assert cfg.field_map == {}
 
     def test_rejects_bad_url(self):
