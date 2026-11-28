@@ -961,7 +961,10 @@ class TestSearchByAddress:
         text = tool_text(result)
         assert "matched directly on Parcel_Address" in text
         where = calls[0][1]["where"]
-        assert "Parcel_Address LIKE '%144 W 15TH AVE%'" in where
+        assert (
+            "(Parcel_Address LIKE '144 W 15TH AVE%' "
+            "OR Parcel_Address LIKE '% 144 W 15TH AVE%')"
+        ) in where
         # Only the property layer was queried.
         assert all(DEFAULT_PROPERTY_LAYER_URL in c[0] for c in calls)
 
@@ -994,9 +997,9 @@ class TestSearchByAddress:
         assert SAMPLE_RECORD["Parcel_ID"] in text
         addr_calls = [c for c in calls if is_addr_layer(*c)]
         assert addr_calls[0][1]["outSR"] == "4326"
-        assert (
-            "FULL_ADDRESS LIKE '%26800 EKLUTNA VILLAGE RD%'"
-            in addr_calls[0][1]["where"]
+        assert addr_calls[0][1]["where"] == (
+            "(FULL_ADDRESS LIKE '26800 EKLUTNA VILLAGE RD%' "
+            "OR FULL_ADDRESS LIKE '% 26800 EKLUTNA VILLAGE RD%')"
         )
         pip_calls = [c for c in calls if is_pip(*c)]
         assert pip_calls[0][1]["inSR"] == "4326"
@@ -3197,10 +3200,17 @@ class TestLikeWildcardsAreLiteral:
     async def test_address_wildcards_escaped_on_both_layers(self, plugin):
         calls = install_client(plugin)
         await run_tool(plugin, "search_by_address", {"address": "1_0 W 15th"})
-        expected = r"LIKE '%1\_0 W 15TH%' ESCAPE '\'"
-        assert f"Parcel_Address {expected}" in calls[0][1]["where"]
-        addr_call = next(c for c in calls if DEFAULT_ADDRESSES_LAYER_URL in c[0])
-        assert addr_call[1]["where"] == f"FULL_ADDRESS {expected}"
+        for field, call in (
+            ("Parcel_Address", calls[0]),
+            (
+                "FULL_ADDRESS",
+                next(c for c in calls if DEFAULT_ADDRESSES_LAYER_URL in c[0]),
+            ),
+        ):
+            assert (
+                rf"({field} LIKE '1\_0 W 15TH%' ESCAPE '\' "
+                rf"OR {field} LIKE '% 1\_0 W 15TH%' ESCAPE '\')"
+            ) in call[1]["where"]
 
     def test_backslash_itself_is_escaped(self):
         clause = AnchorageParcelsPlugin._like("F", "A\\B")

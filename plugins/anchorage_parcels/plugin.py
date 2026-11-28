@@ -379,6 +379,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
     COMPACT_FORMAT_THRESHOLD = 20
     # Max stacked polygons returned for one point-in-polygon lookup.
     POINT_QUERY_LIMIT = 20
+    # How many near-miss addresses search_by_address names when the
+    # address asked for does not exist.
+    NEAR_ADDRESS_LIMIT = 5
     # Below this share of the municipality, warn that the layer does not
     # cover the whole muni. Same threshold as the GIS server.
     COVERAGE_THRESHOLD = moa.COVERAGE_THRESHOLD
@@ -650,6 +653,23 @@ class AnchorageParcelsPlugin(MCPPlugin):
             return f"{expr} LIKE '{prefix}{quoted}{suffix}'"
         escaped = quoted.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         return f"{expr} LIKE '{prefix}{escaped}{suffix}' ESCAPE '\\'"
+
+    @classmethod
+    def _address_like(cls, expr: str, needle: str) -> Tuple[str, bool]:
+        """LIKE clause for an address fragment; (clause, anchored).
+
+        A fragment that begins with a digit must begin a word of the
+        stored address: '44 W 15TH AVE' matched '144 W 15TH AVE' and
+        '444 W 15TH AVE' as a plain substring, and '15TH AVE' matched
+        '115TH AVE'. Neither layer stores a leading space or a doubled
+        one, so "at the start, or after a space" is the whole rule. A
+        fragment that begins with a letter is still a substring.
+        """
+        if not needle[:1].isdigit():
+            return cls._like(expr, needle), False
+        at_start = cls._like(expr, needle, prefix="")
+        after_space = cls._like(expr, needle, prefix="% ")
+        return f"({at_start} OR {after_space})", True
 
     def _assessed_clause(self, include_unassessed: Any) -> Optional[str]:
         """Exclude geometry-only shell records unless asked not to.
@@ -2209,7 +2229,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
         situs_field = self._f("situs_address")
         include_unassessed = self._parse_flag(args, "include_unassessed")
         assessed_clause = self._assessed_clause(include_unassessed)
-        where = self._combine_where(self._like(situs_field, needle), assessed_clause)
+        situs_like, anchored = self._address_like(situs_field, needle)
+        where = self._combine_where(situs_like, assessed_clause)
 
         caveats = _Caveats()
         caveats.add("limit_clamped", clamp_note)
@@ -2270,7 +2291,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         # Fallback: resolve via the address-point layer, then
         # point-in-polygon against the property layer.
         addr_field = self._f("address_full")
-        addr_where = self._like(addr_field, needle)
+        addr_where, _ = self._address_like(addr_field, needle)
         addr_data = await self._layer_query(
             f"{self.plugin_config.addresses_layer_url}/query",
             {
@@ -2284,6 +2305,21 @@ class AnchorageParcelsPlugin(MCPPlugin):
         )
         addr_feats = addr_data.get("features") or []
         if not addr_feats:
+            near = (
+                await self._addresses_containing(situs_field, needle, assessed_clause)
+                if anchored
+                else []
+            )
+            near_note = (
+                (
+                    f"\nDIFFERENT addresses that contain `{address}` inside "
+                    f"a longer number: {', '.join(repr(a) for a in near)}. "
+                    f"None is the address asked for; search one of them "
+                    f"only if it is the one meant."
+                )
+                if near
+                else ""
+            )
             caveats.add(
                 "no_address_match",
                 f"No parcel has a situs address matching `{address}`, and "
@@ -2291,7 +2327,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"Hints: use the abbreviated street type ('AVE', 'ST', "
                 f"'DR'); drop unit/apartment numbers; addresses are "
                 f"stored UPPERCASE (handled automatically); try just the "
-                f"house number + street name (e.g. '144 W 15TH').",
+                f"house number + street name (e.g. '144 W 15TH')." + near_note,
             )
             return _ToolOutput(
                 "\n".join(caveats.messages),
@@ -2377,6 +2413,25 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "\n".join(lines) + "\n" + body,
             self._envelope(query, summary, caveats, rows=pip_records),
         )
+
+    async def _addresses_containing(
+        self, situs_field: str, needle: str, assessed_clause: Optional[str]
+    ) -> List[str]:
+        """Up to NEAR_ADDRESS_LIMIT stored addresses holding `needle` anywhere.
+
+        Asked only after the word-anchored search found nothing, to name
+        what a plain substring match would have returned ('144 W 15TH
+        AVE' for '44 W 15TH AVE'). It is a courtesy: if it fails, the
+        "no match" answer stands without it.
+        """
+        where = self._combine_where(self._like(situs_field, needle), assessed_clause)
+        try:
+            records, _ = await self._query_property_layer(where, situs_field, 50)
+        except Exception as exc:
+            logger.warning("near-address lookup failed: %s", exc)
+            return []
+        found = sorted({r[situs_field] for r in records if r.get(situs_field)})
+        return found[: self.NEAR_ADDRESS_LIMIT]
 
     # ── Tool: parcels_at_point ────────────────────────────────────────
 
@@ -3508,11 +3563,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"property layer (the response says which path was "
                     f"used). Example: search_by_address(address='144 W "
                     f"15th Ave'). Use abbreviated street types (AVE, "
-                    f"ST, DR). The match is on a SUBSTRING of the stored "
-                    f"address, in no particular order: '44 W 15TH AVE' also "
-                    f"returns 144 and 444 W 15TH AVE, so check "
-                    f"Parcel_Address on each row before treating it as the "
-                    f"address asked for. Unlike the other search tools it "
+                    f"ST, DR). A fragment is enough ('W 15TH AVE' lists the "
+                    f"street, in no particular order), but one that starts "
+                    f"with a number must start a word of the stored "
+                    f"address: '44 W 15TH AVE' does not return 144 or 444 "
+                    f"W 15TH AVE, and '15TH AVE' does not return 115TH "
+                    f"AVE. Unlike the other search tools it "
                     f"looks in EVERY category (Parcel, Lease, Economic), so "
                     f"one address can return several records; GIS_Category "
                     f"says which each is. {summary_note} {unassessed_note}"

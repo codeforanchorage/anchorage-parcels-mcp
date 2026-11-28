@@ -292,7 +292,7 @@ class TestWording:
 
     def test_address_search_says_what_it_matches(self, plugin):
         text = {t.name: t for t in plugin.get_tools()}["search_by_address"].description
-        assert "SUBSTRING" in text
+        assert "must start a word" in text
         assert "EVERY category" in text
 
 
