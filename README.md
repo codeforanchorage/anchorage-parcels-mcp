@@ -42,7 +42,7 @@ For a client that only speaks stdio, see [`client/`](client/README.md)
   zoning district?"
 - "What is the median assessed value by zoning district?"
 - "Which ten owners hold the most parcels?"
-- "What parcel is at 61.2176, -149.8997?"
+- "What parcel is at 61.2165, -149.8947?"
 
 ## Tools
 
