@@ -62,13 +62,17 @@ class AnchorageParcelsPluginConfig(BaseModel):
             "your layer's field names. Only list the fields that differ."
         ),
     )
+    # 20, not 30: the default must sit under the Lambda timeout (28s, itself
+    # under API Gateway's hard 29s). At 30 a deployment that left `timeout`
+    # out had a hung upstream kill the Lambda instead of returning an error.
     timeout: int = Field(
-        default=30,
+        default=20,
         ge=1,
         le=300,
         description=(
             "Seconds allowed for one tool call, shared by every ArcGIS "
-            "request and retry it makes; also the per-request HTTP timeout"
+            "request and retry it makes; also the per-request HTTP timeout. "
+            "Keep it below aws.lambda_timeout"
         ),
     )
 

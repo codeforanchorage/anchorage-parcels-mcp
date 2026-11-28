@@ -201,6 +201,7 @@ CAVEAT_CODES = (
     "empty_columns_dropped",  # columns null across the whole page, omitted
     "limited_coverage",  # layer extent covers well under the whole muni
     "zoning_variants_matched",  # hyphenated/unhyphenated zoning twin folded in
+    "zoning_variants_split",  # grouped by zoning: twins are separate groups
 )
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -654,8 +655,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
         """Exclude geometry-only shell records unless asked not to.
 
         ~1,000 features on this layer carry geometry and a formatted
-        parcel number but NO assessment join: null Parcel_ID,
-        Legal_Description, Land_Use and Appraised_Total_Value. They are
+        parcel number but NO assessment join: an empty Parcel_ID (it was
+        null until 2026; both are filtered) and null Legal_Description,
+        Land_Use and Appraised_Total_Value. They are
         indistinguishable from real parcels in a count, so every
         "how many parcels" answer was inflated by ~1% (98,391 -> 97,368
         for GIS_Category='Parcel'). Filtered out by default; pass
@@ -763,10 +765,12 @@ class AnchorageParcelsPlugin(MCPPlugin):
     def _coverage_caveat(self) -> Optional[str]:
         """Warn when the layer does not cover the whole municipality.
 
-        The GIS server emits this for the SAME layer; without it a caller
-        here has no way to know that Girdwood and outer Eagle River are
-        systematically under-represented in an aggregate answer. Silent
-        when coverage could not be computed, rather than guessed.
+        The GIS server emits this for the SAME layer, from the same
+        maths (moa.py). PropertyInformation itself covers ~95% of the
+        municipality's bounding box, so for the MOA layer this stays
+        silent; it is here for a layer that really is partial (a fork, or
+        a republish gone wrong). Silent, too, when coverage could not be
+        computed, rather than guessed.
         """
         if self._coverage_pct is None or self._coverage_pct >= self.COVERAGE_THRESHOLD:
             return None
@@ -784,8 +788,8 @@ class AnchorageParcelsPlugin(MCPPlugin):
             return None
         return (
             "**UNASSESSED RECORDS INCLUDED:** results contain "
-            "geometry-only records with no assessment data (null "
-            "parcel number, legal description, land use and valuation). "
+            "geometry-only records with no assessment data (empty "
+            "Parcel_ID; no legal description, land use or valuation). "
             "They inflate counts by ~1% and their assessment fields "
             "will be empty. Omit include_unassessed to exclude them."
         )
@@ -843,6 +847,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
             note = (
                 f"**LIMIT CLAMPED:** requested limit={requested} exceeds "
                 f"the maximum of {maximum}; returning at most {maximum}."
+            )
+        elif requested < 1:
+            note = (
+                f"**LIMIT CLAMPED:** requested limit={requested} is below "
+                f"the minimum of 1; returning at most 1."
             )
         return limit, note
 
@@ -1275,6 +1284,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         caveats: Optional["_Caveats"] = None,
         truncation_advice: Optional[str] = None,
         more_exist: bool = False,
+        last_page: bool = False,
     ) -> str:
         """List records with provenance header, TOTAL COUNT line, and a
         truncation banner (conventions from anchorage_gis
@@ -1287,8 +1297,13 @@ class AnchorageParcelsPlugin(MCPPlugin):
         disagree about what went wrong."""
         caveats = caveats if caveats is not None else _Caveats()
         lines = self._provenance(where=where, out_fields=out_fields, limit=limit)
+        # `last_page`: a paged caller reached the end. The page is then
+        # fewer records than the total without anything being withheld.
         truncated = (
-            total_count is not None and len(records) > 0 and total_count > len(records)
+            not last_page
+            and total_count is not None
+            and len(records) > 0
+            and total_count > len(records)
         )
         advice = truncation_advice or (
             "Use the TOTAL COUNT line below for 'how many?' questions, or "
@@ -2121,7 +2136,7 @@ class AnchorageParcelsPlugin(MCPPlugin):
         records_task = self._query_property_layer(
             where, self._summary_fields, limit, order_by=order_by
         )
-        (records, _), total = await asyncio.gather(
+        (records, exceeded), total = await asyncio.gather(
             records_task, self._fetch_count(where)
         )
         caveats = _Caveats()
@@ -2143,6 +2158,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"(ordered by appraised value, highest first)\n"
             ),
             caveats=caveats,
+            truncation_advice=(
+                "Use the TOTAL COUNT line below for 'how many?' questions; "
+                "raise `limit` (maximum 1000), narrow the name, or page "
+                "through all of them with query_parcels and offset."
+            ),
+            # The count can fail while the page comes back full: the
+            # server's own "more rows remain" is then all there is.
+            more_exist=exceeded,
         )
         if not records:
             text += self._no_data_hint(where)
@@ -2163,7 +2186,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     "returned_count": len(records),
                     "total_count": total,
                     "truncated": bool(
-                        total is not None and records and total > len(records)
+                        records
+                        and (
+                            (total is not None and total > len(records))
+                            or (total is None and exceeded)
+                        )
                     ),
                 },
                 caveats,
@@ -2337,7 +2364,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             )
         body = self._format_records(
             pip_records,
-            limit,
+            # The point lookup has its own cap, not the caller's `limit`:
+            # printing the latter gave "Returned 20 record(s) (limit: 10)".
+            self.POINT_QUERY_LIMIT,
             out_fields=self._summary_fields,
             heading=None,
             # Caveats are already rendered above; pass a fresh list so
@@ -2600,6 +2629,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             where=full_where,
             out_fields=out_fields,
             caveats=caveats,
+            # The last page of several is short of the total without
+            # being a sample of anything.
+            last_page=not has_more,
         )
         if not records and not past_the_end:
             text += self._no_data_hint(full_where)
@@ -2619,9 +2651,10 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 {
                     "returned_count": len(records),
                     "total_count": total,
-                    "truncated": bool(
-                        total is not None and records and total > len(records)
-                    ),
+                    # Records FOLLOW this page. It used to be "the total
+                    # exceeds this page", which was also true of the last
+                    # page: truncated, with nowhere further to go.
+                    "truncated": bool(records and has_more),
                     "next_offset": next_offset,
                     "exceeded_transfer_limit": bool(exceeded),
                 },
@@ -2815,6 +2848,29 @@ class AnchorageParcelsPlugin(MCPPlugin):
                 f"(search_by_owner finds them) before quoting a total or "
                 f"calling anyone the largest owner.",
             )
+        if rows and group_by == self._f("zoning"):
+            # A filter on one spelling is widened to its twin
+            # (`_expand_zoning_variants`); a grouping cannot be, so say
+            # which groups are one district under two spellings.
+            spellings: Dict[str, List[str]] = {}
+            for row in rows:
+                value = row.get(group_by)
+                if isinstance(value, str) and value.strip():
+                    spellings.setdefault(
+                        value.strip().replace("-", "").upper(), []
+                    ).append(value)
+            twins = [sorted(v) for v in spellings.values() if len(v) > 1]
+            if twins:
+                caveats.add(
+                    "zoning_variants_split",
+                    f"**{group_by} IS NOT NORMALIZED:** these groups are one "
+                    f"district stored under two spellings: "
+                    + "; ".join(" and ".join(repr(s) for s in t) for t in sorted(twins))
+                    + ". Each spelling is its own group below. Read them "
+                    "together, and for one figure across both filter instead "
+                    f"(where=\"{group_by} = '{sorted(twins)[0][-1]}'\" matches "
+                    "both spellings).",
+                )
         stat_label = stat_type
         if percentile is not None:
             stat_label = f"percentile_cont({percentile})"
@@ -2987,8 +3043,9 @@ class AnchorageParcelsPlugin(MCPPlugin):
             "default": False,
             "description": (
                 "Include geometry-only records that carry NO assessment "
-                "data (null parcel number, legal description, land use "
-                "and valuation). ~1,000 such shells exist and are "
+                "data (Parcel_ID is the empty string '', not null; no "
+                "legal description, land use or valuation). ~1,000 such "
+                "shells exist and are "
                 "EXCLUDED by default because they inflate every count by "
                 "about 1%. Pass true only when you specifically want the "
                 "unjoined geometry."
@@ -3218,7 +3275,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
             {
                 "returned_count": {"type": "integer"},
                 "total_count": _NULLABLE_COUNT,
-                "truncated": {"type": "boolean"},
+                "truncated": {
+                    "type": "boolean",
+                    "description": (
+                        "True when records follow this page (next_offset "
+                        "is then set). False on the last page, even though "
+                        "total_count exceeds returned_count there."
+                    ),
+                },
                 "next_offset": {
                     "type": ["integer", "null"],
                     "description": "Null when there is no further page.",
@@ -3327,8 +3391,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                         "parcel_id": {
                             "type": "string",
                             "description": (
-                                "Parcel number in any format (hyphens "
-                                "optional, 8 or 11 digits)"
+                                "Parcel number in any format: the 8-digit "
+                                "base or the full 11 digits, hyphens and "
+                                "leading zeros optional. The base number "
+                                "matches every record under it (all units "
+                                "of a condominium); 11 digits name one."
                             ),
                         },
                         "category": category_schema,
@@ -3371,8 +3438,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                         "parcel_id": {
                             "type": "string",
                             "description": (
-                                "Parcel number in any format (hyphens "
-                                "optional, 8 or 11 digits)"
+                                "Parcel number in any format: the 8-digit "
+                                "base or the full 11 digits, hyphens and "
+                                "leading zeros optional. The base number "
+                                "matches every record under it (all units "
+                                "of a condominium); 11 digits name one."
                             ),
                         },
                         "category": {
@@ -3438,7 +3508,14 @@ class AnchorageParcelsPlugin(MCPPlugin):
                     f"property layer (the response says which path was "
                     f"used). Example: search_by_address(address='144 W "
                     f"15th Ave'). Use abbreviated street types (AVE, "
-                    f"ST, DR). {summary_note} {unassessed_note}"
+                    f"ST, DR). The match is on a SUBSTRING of the stored "
+                    f"address, in no particular order: '44 W 15TH AVE' also "
+                    f"returns 144 and 444 W 15TH AVE, so check "
+                    f"Parcel_Address on each row before treating it as the "
+                    f"address asked for. Unlike the other search tools it "
+                    f"looks in EVERY category (Parcel, Lease, Economic), so "
+                    f"one address can return several records; GIS_Category "
+                    f"says which each is. {summary_note} {unassessed_note}"
                 ),
                 input_schema={
                     "type": "object",
@@ -3454,7 +3531,11 @@ class AnchorageParcelsPlugin(MCPPlugin):
                         "limit": {
                             "type": "integer",
                             "default": 10,
-                            "description": "Max records (1-100)",
+                            "description": (
+                                "Max records (1-100). Applies to the direct "
+                                "address match; the address-point fallback "
+                                "returns up to 20."
+                            ),
                         },
                         "include_unassessed": include_unassessed_schema,
                     },

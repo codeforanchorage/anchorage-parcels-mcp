@@ -48,7 +48,9 @@ plugins:
     # subdivisions_layer_url: "https://services2.arcgis.com/<org>/arcgis/rest/services/<Subdivisions>/FeatureServer/0"
     city_name: "Municipality of Anchorage"
     field_map: {} # logical->physical overrides; see DEFAULT_FIELD_MAP in plugins/anchorage_parcels/plugin.py
-    timeout: 30
+    # Seconds for one whole tool call. Keep it BELOW aws.lambda_timeout,
+    # which must itself stay below API Gateway's fixed 29s.
+    timeout: 20
 
   # yamllint disable rule:comments-indentation
   # Custom: Add your own plugins here
@@ -64,7 +66,10 @@ aws:
   region: "us-east-1" # AWS region for Lambda
   lambda_name: "your-opendata-mcp" # Lambda function name (will be auto-generated if not set)
   lambda_memory: 512 # Lambda memory in MB (128-10240)
-  lambda_timeout: 120 # Lambda timeout in seconds (max 900)
+  # Keep this BELOW 29: the REST API Gateway in front of the Lambda gives
+  # up at a fixed 29s, so a longer Lambda timeout only burns compute after
+  # the caller already has a 504. The plugin's `timeout` sits below this.
+  lambda_timeout: 28
 
 # Logging configuration
 logging:
